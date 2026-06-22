@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TikTok → Instagram Reels auto-crossposter. Kein TikTok API nötig – nutzt yt-dlp."""
+"""TikTok → Instagram Reels + YouTube Shorts auto-crossposter."""
 
 import os
 import sys
@@ -7,6 +7,8 @@ import json
 import time
 import base64
 import logging
+import shutil
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,63 +25,57 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TIKTOK_USERNAME    = os.environ["TIKTOK_USERNAME"]   # ohne @
-TIKTOK_COOKIES_B64 = os.environ["TIKTOK_COOKIES_B64"]
+TIKTOK_USERNAME      = os.environ["TIKTOK_USERNAME"]
+TIKTOK_COOKIES_B64   = os.environ["TIKTOK_COOKIES_B64"]
 
-INSTAGRAM_USER_ID  = os.environ["INSTAGRAM_USER_ID"]
-INSTAGRAM_APP_ID   = os.environ["INSTAGRAM_APP_ID"]
+INSTAGRAM_USER_ID    = os.environ["INSTAGRAM_USER_ID"]
+INSTAGRAM_APP_ID     = os.environ["INSTAGRAM_APP_ID"]
 INSTAGRAM_APP_SECRET = os.environ["INSTAGRAM_APP_SECRET"]
 
-GITHUB_TOKEN       = os.environ["GITHUB_TOKEN"]
-GITHUB_REPOSITORY  = os.environ["GITHUB_REPOSITORY"]  # owner/repo
+GITHUB_TOKEN         = os.environ["GITHUB_TOKEN"]
+GITHUB_REPOSITORY    = os.environ["GITHUB_REPOSITORY"]
 
-GIST_TOKEN         = os.environ["GIST_TOKEN"]
-GIST_ID            = os.environ["GIST_ID"]
+GIST_TOKEN           = os.environ["GIST_TOKEN"]
+GIST_ID              = os.environ["GIST_ID"]
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 
 GIST_FILENAME = "state.json"
-IG_GRAPH  = "https://graph.instagram.com/v21.0"
+IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
-# ── Caption-Verarbeitung ──────────────────────────────────────────────────────
+# ── Caption ───────────────────────────────────────────────────────────────────
 HASHTAG_POOL = ["#gym", "#sport", "#fitness", "#deutsch", "#meme", "#durchziehen"]
-FIXED_FOOTER = "Checkt meine anderen Socials ab. Mehr Content zum Thema Gym, Ernährung und Lifestyle von mir auf TikTok @onursportlich"
+FIXED_FOOTER = (
+    "Checkt meine anderen Socials ab. Mehr Content zum Thema Gym, "
+    "Ernährung und Lifestyle von mir auf TikTok @onursportlich"
+)
 
-def process_caption(raw_caption: str) -> str:
-    """
-    - Extrahiert Hashtags aus TikTok-Caption
-    - Füllt auf 5 Hashtags aus Pool auf (in Pool-Reihenfolge, keine Duplikate)
-    - Hängt festen Footer an
-    """
-    words = raw_caption.split()
-    hashtags = [w for w in words if w.startswith("#")]
+def process_caption(raw: str) -> str:
+    words = raw.split()
+    hashtags   = [w for w in words if w.startswith("#")]
     text_words = [w for w in words if not w.startswith("#")]
     caption_text = " ".join(text_words).strip()
 
-    # Duplikate entfernen, Reihenfolge beibehalten
     seen: set[str] = set()
-    unique_hashtags: list[str] = []
+    unique: list[str] = []
     for h in hashtags:
-        key = h.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_hashtags.append(h)
+        if h.lower() not in seen:
+            seen.add(h.lower())
+            unique.append(h)
 
-    # Aus Pool auffüllen bis 5
-    for pool_tag in HASHTAG_POOL:
-        if len(unique_hashtags) >= 5:
+    for tag in HASHTAG_POOL:
+        if len(unique) >= 5:
             break
-        if pool_tag.lower() not in seen:
-            unique_hashtags.append(pool_tag)
-            seen.add(pool_tag.lower())
+        if tag.lower() not in seen:
+            unique.append(tag)
+            seen.add(tag.lower())
 
-    hashtag_str = " ".join(unique_hashtags[:5])
-    return f"{caption_text}\n\n{hashtag_str}\n\n{FIXED_FOOTER}"
+    return f"{caption_text}\n\n{' '.join(unique[:5])}\n\n{FIXED_FOOTER}"
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -93,7 +89,7 @@ def telegram(text: str) -> None:
             timeout=10,
         )
     except Exception as e:
-        log.warning(f"Telegram send failed: {e}")
+        log.warning(f"Telegram: {e}")
 
 
 # ── State (Gist) ──────────────────────────────────────────────────────────────
@@ -104,8 +100,7 @@ def read_state() -> dict:
         timeout=10,
     )
     r.raise_for_status()
-    content = r.json()["files"][GIST_FILENAME]["content"]
-    return json.loads(content)
+    return json.loads(r.json()["files"][GIST_FILENAME]["content"])
 
 
 def write_state(state: dict) -> None:
@@ -119,19 +114,13 @@ def write_state(state: dict) -> None:
 
 
 # ── TikTok via yt-dlp ────────────────────────────────────────────────────────
-def write_cookie_file(dest_dir: str) -> str:
-    cookie_data = base64.b64decode(TIKTOK_COOKIES_B64).decode()
-    cookie_file = str(Path(dest_dir) / "cookies.txt")
-    Path(cookie_file).write_text(cookie_data)
-    return cookie_file
+def write_cookie_file(dest: str) -> str:
+    path = str(Path(dest) / "cookies.txt")
+    Path(path).write_text(base64.b64decode(TIKTOK_COOKIES_B64).decode())
+    return path
 
 
 def get_profile_videos(cookie_file: str, limit: int = 10) -> list[dict]:
-    """
-    Listet die neuesten Videos vom TikTok-Profil via yt-dlp.
-    Gibt Liste von Dicts mit id, description, webpage_url zurück (neueste zuerst).
-    """
-    profile_url = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
     ydl_opts = {
         "cookiefile": cookie_file,
         "extract_flat": True,
@@ -141,36 +130,40 @@ def get_profile_videos(cookie_file: str, limit: int = 10) -> list[dict]:
         "socket_timeout": 30,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
+        info = ydl.extract_info(f"https://www.tiktok.com/@{TIKTOK_USERNAME}", download=False)
 
-    entries = info.get("entries", []) if info else []
     videos = []
-    for e in entries:
+    for e in (info or {}).get("entries", []):
         if not e:
             continue
+        vid_id = e.get("id") or e.get("url", "").split("/")[-1]
         videos.append({
-            "id": e.get("id") or e.get("url", "").split("/")[-1],
+            "id": vid_id,
             "description": e.get("description") or e.get("title") or "",
-            "url": e.get("url") or e.get("webpage_url") or f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{e.get('id')}",
+            "url": e.get("url") or e.get("webpage_url")
+                   or f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}",
         })
     return videos
 
 
-def download_video(video_url: str, cookie_file: str, dest_dir: str) -> str:
+def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     """
-    Lädt TikTok-Inhalt herunter.
-    - Video → direkt als MP4
-    - Foto-Post (Slideshow) → Thumbnail + Audio werden per ffmpeg zu 7-Sekunden-MP4 kombiniert
+    Lädt TikTok-Inhalt in work_dir herunter.
+    - Normales Video → video.mp4
+    - Foto-Post/Slideshow → Thumbnail + Audio per ffmpeg zu 7s-MP4
+    Jedes Video bekommt ein eigenes work_dir (kein Konflikt zwischen Videos).
     """
-    import subprocess
-
-    output_template = str(Path(dest_dir) / "video.%(ext)s")
+    out_tpl = str(Path(work_dir) / "video.%(ext)s")
     ydl_opts = {
         "cookiefile": cookie_file,
-        "format": "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-        "outtmpl": output_template,
+        "format": (
+            "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
+        ),
+        "outtmpl": out_tpl,
         "merge_output_format": "mp4",
         "writethumbnail": True,
+        "convert_thumbnails": "jpg",
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 60,
@@ -178,30 +171,31 @@ def download_video(video_url: str, cookie_file: str, dest_dir: str) -> str:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
 
+    log.info(f"Dateien in work_dir: {[f.name for f in Path(work_dir).iterdir()]}")
+
     # Normales Video
-    mp4_files = list(Path(dest_dir).glob("video.mp4"))
-    if mp4_files:
-        return str(mp4_files[0])
+    if (Path(work_dir) / "video.mp4").exists():
+        return str(Path(work_dir) / "video.mp4")
 
-    # Foto-Post: Audio + Thumbnail zu MP4 kombinieren
-    audio_files = list(Path(dest_dir).glob("video.mp3"))
-    thumb_files = [
-        f for f in Path(dest_dir).iterdir()
-        if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and "video" in f.name
-    ]
-
+    # Foto-Post: Audio vorhanden?
+    audio_files = list(Path(work_dir).glob("video.mp3"))
     if not audio_files:
-        raise FileNotFoundError(f"Kein Video/Audio gefunden: {list(Path(dest_dir).iterdir())}")
+        raise FileNotFoundError(
+            f"Kein Video/Audio gefunden: {[f.name for f in Path(work_dir).iterdir()]}"
+        )
 
     audio = str(audio_files[0])
-    output_mp4 = str(Path(dest_dir) / "output.mp4")
+    output_mp4 = str(Path(work_dir) / "output.mp4")
+    thumb_files = [
+        f for f in Path(work_dir).iterdir()
+        if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+    ]
 
     if thumb_files:
-        log.info("Foto-Post erkannt → kombiniere Thumbnail + Audio zu 7s MP4")
-        thumb = str(thumb_files[0])
-        subprocess.run([
+        log.info(f"Foto-Post → {thumb_files[0].name} + Audio → 7s MP4")
+        result = subprocess.run([
             "ffmpeg", "-y",
-            "-loop", "1", "-i", thumb,
+            "-loop", "1", "-i", str(thumb_files[0]),
             "-i", audio,
             "-t", "7",
             "-c:v", "libx264", "-tune", "stillimage",
@@ -209,10 +203,12 @@ def download_video(video_url: str, cookie_file: str, dest_dir: str) -> str:
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             output_mp4,
-        ], check=True, capture_output=True)
+        ], capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg fehlgeschlagen: {result.stderr.decode()}")
     else:
         log.info("Foto-Post ohne Thumbnail → schwarzes Bild + Audio")
-        subprocess.run([
+        result = subprocess.run([
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30",
             "-i", audio,
@@ -220,14 +216,15 @@ def download_video(video_url: str, cookie_file: str, dest_dir: str) -> str:
             "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
             "-pix_fmt", "yuv420p",
             output_mp4,
-        ], check=True, capture_output=True)
+        ], capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg fehlgeschlagen: {result.stderr.decode()}")
 
     return output_mp4
 
 
-# ── Temporäres Hosting via GitHub Release ─────────────────────────────────────
+# ── GitHub Release (temp hosting für Instagram) ───────────────────────────────
 def upload_to_github_release(video_path: str, tag: str) -> tuple[str, int]:
-    """Erstellt einen GitHub Release, lädt Video hoch. Gibt (url, release_id) zurück."""
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -243,8 +240,7 @@ def upload_to_github_release(video_path: str, tag: str) -> tuple[str, int]:
     upload_base: str = r.json()["upload_url"].split("{")[0]
 
     file_size = Path(video_path).stat().st_size
-    log.info(f"Uploading {file_size / 1_000_000:.1f} MB to GitHub Release...")
-
+    log.info(f"GitHub Release Upload: {file_size / 1_000_000:.1f} MB")
     with open(video_path, "rb") as f:
         r = requests.post(
             f"{upload_base}?name=video.mp4",
@@ -271,63 +267,58 @@ def delete_github_release(release_id: int, tag: str) -> None:
             headers=headers, timeout=10,
         )
     except Exception as e:
-        log.warning(f"GitHub Release cleanup fehlgeschlagen (nicht kritisch): {e}")
+        log.warning(f"GitHub Release cleanup: {e}")
 
 
 # ── Instagram ─────────────────────────────────────────────────────────────────
-def refresh_instagram_token(access_token: str) -> str:
+def refresh_instagram_token(token: str) -> str:
     r = requests.get(
         f"{IG_GRAPH}/refresh_access_token",
-        params={"grant_type": "ig_refresh_token", "access_token": access_token},
+        params={"grant_type": "ig_refresh_token", "access_token": token},
         timeout=15,
     )
     if r.status_code != 200:
-        log.warning(f"Instagram Token-Refresh fehlgeschlagen (weiter mit altem): {r.text}")
-        return access_token
+        log.warning(f"Instagram Token-Refresh fehlgeschlagen: {r.text}")
+        return token
     return r.json()["access_token"]
 
 
-def create_instagram_container(video_url: str, caption: str, access_token: str) -> str:
+def create_instagram_container(video_url: str, caption: str, token: str) -> str:
     r = requests.post(
         f"{IG_GRAPH}/{INSTAGRAM_USER_ID}/media",
-        params={"access_token": access_token},
-        json={
-            "media_type": "REELS",
-            "video_url": video_url,
-            "caption": caption,
-            "share_to_feed": True,
-        },
+        params={"access_token": token},
+        json={"media_type": "REELS", "video_url": video_url,
+              "caption": caption, "share_to_feed": True},
         timeout=30,
     )
     if r.status_code != 200:
-        raise RuntimeError(f"Instagram Container-Erstellung fehlgeschlagen: {r.text}")
+        raise RuntimeError(f"Instagram Container fehlgeschlagen: {r.text}")
     return r.json()["id"]
 
 
-def wait_for_container(container_id: str, access_token: str, max_wait: int = 600) -> None:
+def wait_for_container(container_id: str, token: str, max_wait: int = 600) -> None:
     deadline = time.time() + max_wait
     while time.time() < deadline:
         r = requests.get(
             f"{IG_GRAPH}/{container_id}",
-            params={"fields": "status_code,status", "access_token": access_token},
+            params={"fields": "status_code,status", "access_token": token},
             timeout=15,
         )
         r.raise_for_status()
-        data = r.json()
-        status = data.get("status_code")
+        status = r.json().get("status_code")
         log.info(f"Container {container_id}: {status}")
         if status == "FINISHED":
             return
         if status == "ERROR":
-            raise RuntimeError(f"Instagram Container-Fehler: {data}")
+            raise RuntimeError(f"Instagram Container-Fehler: {r.json()}")
         time.sleep(20)
-    raise TimeoutError(f"Container {container_id} nach {max_wait}s noch nicht FINISHED")
+    raise TimeoutError(f"Container {container_id} Timeout nach {max_wait}s")
 
 
-def publish_instagram_reel(container_id: str, access_token: str) -> str:
+def publish_instagram_reel(container_id: str, token: str) -> str:
     r = requests.post(
         f"{IG_GRAPH}/{INSTAGRAM_USER_ID}/media_publish",
-        params={"access_token": access_token},
+        params={"access_token": token},
         json={"creation_id": container_id},
         timeout=30,
     )
@@ -339,6 +330,7 @@ def publish_instagram_reel(container_id: str, access_token: str) -> str:
 # ── YouTube Shorts ────────────────────────────────────────────────────────────
 def get_youtube_token() -> str | None:
     if not (YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REFRESH_TOKEN):
+        log.info("YouTube: Secrets nicht konfiguriert → übersprungen")
         return None
     r = requests.post(
         "https://oauth2.googleapis.com/token",
@@ -353,22 +345,19 @@ def get_youtube_token() -> str | None:
     if r.status_code != 200:
         log.warning(f"YouTube Token-Refresh fehlgeschlagen: {r.text}")
         return None
+    log.info("YouTube Token erfolgreich geladen")
     return r.json()["access_token"]
 
 
-def upload_to_youtube(video_path: str, title: str, description: str, access_token: str) -> str:
-    """Lädt Video als YouTube Short hoch. Gibt Video-ID zurück."""
+def upload_to_youtube(video_path: str, title: str, description: str, token: str) -> str:
     file_size = Path(video_path).stat().st_size
-
-    # #Shorts im Titel damit YouTube es als Short erkennt
     yt_title = (title[:95] + " #Shorts") if title else "#Shorts"
-    yt_description = description + "\n\n#Shorts"
 
     metadata = json.dumps({
         "snippet": {
             "title": yt_title,
-            "description": yt_description,
-            "categoryId": "17",  # Sports
+            "description": description + "\n\n#Shorts",
+            "categoryId": "17",
         },
         "status": {
             "privacyStatus": "public",
@@ -376,11 +365,11 @@ def upload_to_youtube(video_path: str, title: str, description: str, access_toke
         },
     })
 
-    # Resumable Upload initiieren
     r = requests.post(
-        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+        "https://www.googleapis.com/upload/youtube/v3/videos"
+        "?uploadType=resumable&part=snippet,status",
         headers={
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=UTF-8",
             "X-Upload-Content-Type": "video/mp4",
             "X-Upload-Content-Length": str(file_size),
@@ -391,7 +380,7 @@ def upload_to_youtube(video_path: str, title: str, description: str, access_toke
     r.raise_for_status()
     upload_url = r.headers["Location"]
 
-    log.info(f"YouTube Upload gestartet ({file_size / 1_000_000:.1f} MB)...")
+    log.info(f"YouTube Upload: {file_size / 1_000_000:.1f} MB")
     with open(video_path, "rb") as f:
         r = requests.put(
             upload_url,
@@ -415,15 +404,13 @@ def main() -> None:
         telegram(msg)
         sys.exit(1)
 
-    # Instagram Token refreshen
     state["instagram_access_token"] = refresh_instagram_token(state["instagram_access_token"])
-
+    yt_token = get_youtube_token()
     last_id: str | None = state.get("last_video_id")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cookie_file = write_cookie_file(tmpdir)
+    with tempfile.TemporaryDirectory() as base_dir:
+        cookie_file = write_cookie_file(base_dir)
 
-        # Neueste Videos vom Profil holen
         try:
             videos = get_profile_videos(cookie_file)
         except Exception as e:
@@ -437,15 +424,14 @@ def main() -> None:
             write_state(state)
             return
 
-        # Erster Run: nur aktuelle ID speichern, nichts posten
+        # Erster Run
         if last_id is None:
             state["last_video_id"] = videos[0]["id"]
             write_state(state)
-            log.info(f"Erster Run: Video-ID {videos[0]['id']!r} gespeichert. Ab nächstem neuen Video wird gepostet.")
-            telegram("✅ <b>Crossposter initialisiert!</b>\nAb dem nächsten neuen TikTok-Video wird automatisch auf Instagram gepostet.")
+            log.info(f"Erster Run: ID {videos[0]['id']!r} gespeichert.")
+            telegram("✅ <b>Crossposter initialisiert!</b>\nAb dem nächsten TikTok-Video wird automatisch gepostet.")
             return
 
-        # Neue Videos ermitteln (alles vor last_id, älteste zuerst verarbeiten)
         new_videos = []
         for v in videos:
             if v["id"] == last_id:
@@ -458,69 +444,69 @@ def main() -> None:
             return
 
         log.info(f"{len(new_videos)} neues Video(s) gefunden")
-        new_videos.reverse()  # ältestes zuerst posten
+        new_videos.reverse()
 
         for video in new_videos:
-            video_id  = video["id"]
+            video_id    = video["id"]
             raw_caption = video["description"]
             caption     = process_caption(raw_caption)
             video_url   = video["url"]
-            log.info(f"Verarbeite Video {video_id}: {raw_caption[:60]!r}")
+            log.info(f"Verarbeite {video_id}: {raw_caption[:60]!r}")
+
+            # Eigenes Verzeichnis pro Video → keine Konflikte
+            work_dir = str(Path(base_dir) / video_id)
+            Path(work_dir).mkdir()
 
             release_id: int | None = None
             tag = f"tmp-vid-{video_id}"
 
             try:
-                # Download
                 log.info("Lade Video herunter...")
-                video_path = download_video(video_url, cookie_file, tmpdir)
+                video_path = download_video(video_url, cookie_file, work_dir)
                 log.info(f"Download OK: {video_path}")
 
-                # Temporär auf GitHub hosten
                 log.info("Lade auf GitHub Release hoch...")
                 public_url, release_id = upload_to_github_release(video_path, tag)
-                log.info(f"Öffentliche URL: {public_url}")
+                log.info(f"URL: {public_url}")
 
-                # Instagram Container + warten + veröffentlichen
-                log.info("Erstelle Instagram Media-Container...")
+                log.info("Instagram Container erstellen...")
                 container_id = create_instagram_container(
                     public_url, caption, state["instagram_access_token"]
                 )
                 log.info("Warte auf Instagram-Verarbeitung...")
                 wait_for_container(container_id, state["instagram_access_token"])
-                media_id = publish_instagram_reel(container_id, state["instagram_access_token"])
-                log.info(f"✅ Instagram Reel veröffentlicht: {media_id}")
+                ig_id = publish_instagram_reel(container_id, state["instagram_access_token"])
+                log.info(f"✅ Instagram: {ig_id}")
 
-                # YouTube Short
-                yt_token = get_youtube_token()
+                # YouTube – video_path noch vorhanden (work_dir existiert noch)
                 yt_video_id = None
                 if yt_token:
                     try:
-                        log.info("Lade auf YouTube hoch...")
                         title_text = raw_caption.split("#")[0].strip() or "New Short"
                         yt_video_id = upload_to_youtube(video_path, title_text, caption, yt_token)
-                        log.info(f"✅ YouTube Short hochgeladen: {yt_video_id}")
+                        log.info(f"✅ YouTube Short: {yt_video_id}")
                     except Exception as e:
-                        log.error(f"YouTube Upload fehlgeschlagen: {e}", exc_info=True)
-                        telegram(f"⚠️ YouTube Upload fehlgeschlagen für {video_id}: {e}")
+                        log.error(f"YouTube fehlgeschlagen: {e}", exc_info=True)
+                        telegram(f"⚠️ YouTube fehlgeschlagen für {video_id}: {e}")
 
                 state["last_video_id"] = video_id
                 write_state(state)
 
                 yt_line = f"\nYouTube: <code>{yt_video_id}</code>" if yt_video_id else ""
                 telegram(
-                    f"✅ <b>Neuer Post veröffentlicht!</b>\n"
-                    f"Instagram: <code>{media_id}</code>{yt_line}\n"
+                    f"✅ <b>Neuer Post!</b>\n"
+                    f"Instagram: <code>{ig_id}</code>{yt_line}\n"
                     f"Caption: {raw_caption[:100]}"
                 )
 
             except Exception as e:
-                log.error(f"Fehler bei Video {video_id}: {e}", exc_info=True)
-                telegram(f"❌ <b>Fehler bei Video {video_id}</b>\n{type(e).__name__}: {e}")
+                log.error(f"Fehler bei {video_id}: {e}", exc_info=True)
+                telegram(f"❌ <b>Fehler bei {video_id}</b>\n{type(e).__name__}: {e}")
             finally:
                 if release_id is not None:
-                    log.info("Lösche temporären GitHub Release...")
                     delete_github_release(release_id, tag)
+                # Work-Dir aufräumen
+                shutil.rmtree(work_dir, ignore_errors=True)
 
     log.info("=== Run beendet ===")
 
