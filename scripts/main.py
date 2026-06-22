@@ -118,13 +118,20 @@ def get_profile_videos(cookie_file: str, limit: int = 10) -> list[dict]:
 
 
 def download_video(video_url: str, cookie_file: str, dest_dir: str) -> str:
-    """Lädt Video herunter, gibt Pfad zur MP4 zurück."""
+    """
+    Lädt TikTok-Inhalt herunter.
+    - Video → direkt als MP4
+    - Foto-Post (Slideshow) → Thumbnail + Audio werden per ffmpeg zu 7-Sekunden-MP4 kombiniert
+    """
+    import subprocess
+
     output_template = str(Path(dest_dir) / "video.%(ext)s")
     ydl_opts = {
         "cookiefile": cookie_file,
         "format": "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
         "outtmpl": output_template,
         "merge_output_format": "mp4",
+        "writethumbnail": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 60,
@@ -132,11 +139,51 @@ def download_video(video_url: str, cookie_file: str, dest_dir: str) -> str:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
 
+    # Normales Video
     mp4_files = list(Path(dest_dir).glob("video.mp4"))
-    if not mp4_files:
-        all_files = list(Path(dest_dir).glob("video.*"))
-        raise FileNotFoundError(f"Kein MP4 gefunden, vorhanden: {all_files}")
-    return str(mp4_files[0])
+    if mp4_files:
+        return str(mp4_files[0])
+
+    # Foto-Post: Audio + Thumbnail zu MP4 kombinieren
+    audio_files = list(Path(dest_dir).glob("video.mp3"))
+    thumb_files = [
+        f for f in Path(dest_dir).iterdir()
+        if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and "video" in f.name
+    ]
+
+    if not audio_files:
+        raise FileNotFoundError(f"Kein Video/Audio gefunden: {list(Path(dest_dir).iterdir())}")
+
+    audio = str(audio_files[0])
+    output_mp4 = str(Path(dest_dir) / "output.mp4")
+
+    if thumb_files:
+        log.info("Foto-Post erkannt → kombiniere Thumbnail + Audio zu 7s MP4")
+        thumb = str(thumb_files[0])
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", thumb,
+            "-i", audio,
+            "-t", "7",
+            "-c:v", "libx264", "-tune", "stillimage",
+            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            output_mp4,
+        ], check=True, capture_output=True)
+    else:
+        log.info("Foto-Post ohne Thumbnail → schwarzes Bild + Audio")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30",
+            "-i", audio,
+            "-t", "7",
+            "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            output_mp4,
+        ], check=True, capture_output=True)
+
+    return output_mp4
 
 
 # ── Temporäres Hosting via GitHub Release ─────────────────────────────────────
