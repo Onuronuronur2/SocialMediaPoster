@@ -39,8 +39,47 @@ GIST_ID            = os.environ["GIST_ID"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
+YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
+
 GIST_FILENAME = "state.json"
 IG_GRAPH  = "https://graph.instagram.com/v21.0"
+
+# ── Caption-Verarbeitung ──────────────────────────────────────────────────────
+HASHTAG_POOL = ["#gym", "#sport", "#fitness", "#deutsch", "#meme", "#durchziehen"]
+FIXED_FOOTER = "Checkt meine anderen Socials ab. Mehr Content zum Thema Gym, Ernährung und Lifestyle von mir auf TikTok @onursportlich"
+
+def process_caption(raw_caption: str) -> str:
+    """
+    - Extrahiert Hashtags aus TikTok-Caption
+    - Füllt auf 5 Hashtags aus Pool auf (in Pool-Reihenfolge, keine Duplikate)
+    - Hängt festen Footer an
+    """
+    words = raw_caption.split()
+    hashtags = [w for w in words if w.startswith("#")]
+    text_words = [w for w in words if not w.startswith("#")]
+    caption_text = " ".join(text_words).strip()
+
+    # Duplikate entfernen, Reihenfolge beibehalten
+    seen: set[str] = set()
+    unique_hashtags: list[str] = []
+    for h in hashtags:
+        key = h.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_hashtags.append(h)
+
+    # Aus Pool auffüllen bis 5
+    for pool_tag in HASHTAG_POOL:
+        if len(unique_hashtags) >= 5:
+            break
+        if pool_tag.lower() not in seen:
+            unique_hashtags.append(pool_tag)
+            seen.add(pool_tag.lower())
+
+    hashtag_str = " ".join(unique_hashtags[:5])
+    return f"{caption_text}\n\n{hashtag_str}\n\n{FIXED_FOOTER}"
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -297,6 +336,73 @@ def publish_instagram_reel(container_id: str, access_token: str) -> str:
     return r.json()["id"]
 
 
+# ── YouTube Shorts ────────────────────────────────────────────────────────────
+def get_youtube_token() -> str | None:
+    if not (YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REFRESH_TOKEN):
+        return None
+    r = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": YOUTUBE_CLIENT_ID,
+            "client_secret": YOUTUBE_CLIENT_SECRET,
+            "refresh_token": YOUTUBE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=15,
+    )
+    if r.status_code != 200:
+        log.warning(f"YouTube Token-Refresh fehlgeschlagen: {r.text}")
+        return None
+    return r.json()["access_token"]
+
+
+def upload_to_youtube(video_path: str, title: str, description: str, access_token: str) -> str:
+    """Lädt Video als YouTube Short hoch. Gibt Video-ID zurück."""
+    file_size = Path(video_path).stat().st_size
+
+    # #Shorts im Titel damit YouTube es als Short erkennt
+    yt_title = (title[:95] + " #Shorts") if title else "#Shorts"
+    yt_description = description + "\n\n#Shorts"
+
+    metadata = json.dumps({
+        "snippet": {
+            "title": yt_title,
+            "description": yt_description,
+            "categoryId": "17",  # Sports
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    })
+
+    # Resumable Upload initiieren
+    r = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "video/mp4",
+            "X-Upload-Content-Length": str(file_size),
+        },
+        data=metadata,
+        timeout=30,
+    )
+    r.raise_for_status()
+    upload_url = r.headers["Location"]
+
+    log.info(f"YouTube Upload gestartet ({file_size / 1_000_000:.1f} MB)...")
+    with open(video_path, "rb") as f:
+        r = requests.put(
+            upload_url,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(file_size)},
+            data=f,
+            timeout=300,
+        )
+    r.raise_for_status()
+    return r.json()["id"]
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     log.info("=== Run gestartet ===")
@@ -355,10 +461,11 @@ def main() -> None:
         new_videos.reverse()  # ältestes zuerst posten
 
         for video in new_videos:
-            video_id = video["id"]
-            caption   = video["description"]
-            video_url = video["url"]
-            log.info(f"Verarbeite Video {video_id}: {caption[:60]!r}")
+            video_id  = video["id"]
+            raw_caption = video["description"]
+            caption     = process_caption(raw_caption)
+            video_url   = video["url"]
+            log.info(f"Verarbeite Video {video_id}: {raw_caption[:60]!r}")
 
             release_id: int | None = None
             tag = f"tmp-vid-{video_id}"
@@ -384,14 +491,27 @@ def main() -> None:
                 media_id = publish_instagram_reel(container_id, state["instagram_access_token"])
                 log.info(f"✅ Instagram Reel veröffentlicht: {media_id}")
 
+                # YouTube Short
+                yt_token = get_youtube_token()
+                yt_video_id = None
+                if yt_token:
+                    try:
+                        log.info("Lade auf YouTube hoch...")
+                        title_text = raw_caption.split("#")[0].strip() or "New Short"
+                        yt_video_id = upload_to_youtube(video_path, title_text, caption, yt_token)
+                        log.info(f"✅ YouTube Short hochgeladen: {yt_video_id}")
+                    except Exception as e:
+                        log.error(f"YouTube Upload fehlgeschlagen: {e}", exc_info=True)
+                        telegram(f"⚠️ YouTube Upload fehlgeschlagen für {video_id}: {e}")
+
                 state["last_video_id"] = video_id
                 write_state(state)
 
+                yt_line = f"\nYouTube: <code>{yt_video_id}</code>" if yt_video_id else ""
                 telegram(
-                    f"✅ <b>Neues Reel gepostet!</b>\n"
-                    f"TikTok-ID: <code>{video_id}</code>\n"
-                    f"Instagram-ID: <code>{media_id}</code>\n"
-                    f"Caption: {caption[:150]}"
+                    f"✅ <b>Neuer Post veröffentlicht!</b>\n"
+                    f"Instagram: <code>{media_id}</code>{yt_line}\n"
+                    f"Caption: {raw_caption[:100]}"
                 )
 
             except Exception as e:
