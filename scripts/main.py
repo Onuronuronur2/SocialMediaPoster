@@ -50,12 +50,22 @@ IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
 # ── Caption ───────────────────────────────────────────────────────────────────
 HASHTAG_POOL = ["#gym", "#sport", "#fitness", "#deutsch", "#meme", "#durchziehen"]
-FIXED_FOOTER = (
-    "Checkt meine anderen Socials ab. Mehr Content zum Thema Gym, "
-    "Ernährung und Lifestyle von mir auf TikTok @onursportlich"
+
+INSTAGRAM_FOOTER = (
+    "🔥 Mehr Content von mir:\n"
+    "📱 TikTok: @onursportlich\n"
+    "▶️ YouTube: @onursportlich"
 )
 
-def process_caption(raw: str) -> str:
+YOUTUBE_SOCIALS = (
+    "🔥 Mehr Content von mir:\n"
+    "📱 TikTok (@onursportlich): https://www.tiktok.com/@onursportlich\n"
+    "📸 Instagram (@onursportlich): https://www.instagram.com/onursportlich/"
+)
+
+
+def _extract(raw: str) -> tuple[str, list[str]]:
+    """Gibt (caption_text, unique_hashtags) zurück."""
     words = raw.split()
     hashtags   = [w for w in words if w.startswith("#")]
     text_words = [w for w in words if not w.startswith("#")]
@@ -67,15 +77,34 @@ def process_caption(raw: str) -> str:
         if h.lower() not in seen:
             seen.add(h.lower())
             unique.append(h)
+    return caption_text, unique
+
+
+def process_caption(raw: str) -> str:
+    """Instagram-Caption: max 5 Hashtags aus Pool, fester Footer."""
+    caption_text, unique = _extract(raw)
 
     for tag in HASHTAG_POOL:
         if len(unique) >= 5:
             break
-        if tag.lower() not in seen:
+        if tag.lower() not in {h.lower() for h in unique}:
             unique.append(tag)
-            seen.add(tag.lower())
 
-    return f"{caption_text}\n\n{' '.join(unique[:5])}\n\n{FIXED_FOOTER}"
+    return f"{caption_text}\n\n{INSTAGRAM_FOOTER}\n\n{' '.join(unique[:5])}"
+
+
+def youtube_description(raw: str) -> str:
+    """YouTube-Beschreibung: Text, Social-Links, Hashtags + #Shorts."""
+    caption_text, unique = _extract(raw)
+
+    for tag in HASHTAG_POOL:
+        if len(unique) >= 5:
+            break
+        if tag.lower() not in {h.lower() for h in unique}:
+            unique.append(tag)
+
+    hashtag_line = " ".join(unique[:5]) + " #Shorts"
+    return f"{caption_text}\n\n{YOUTUBE_SOCIALS}\n\n{hashtag_line}"
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -156,14 +185,16 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     out_tpl = str(Path(work_dir) / "video.%(ext)s")
     ydl_opts = {
         "cookiefile": cookie_file,
-        "format": (
-            "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
-        ),
+        # Beste verfügbare Qualität ohne Codec-Einschränkung
+        "format": "bestvideo+bestaudio/best",
         "outtmpl": out_tpl,
         "merge_output_format": "mp4",
         "writethumbnail": True,
         "convert_thumbnails": "jpg",
+        # Falls ffmpeg konvertieren muss: maximale Qualität
+        "postprocessor_args": {
+            "ffmpeg": ["-crf", "18", "-preset", "slow"]
+        },
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 60,
@@ -356,7 +387,7 @@ def upload_to_youtube(video_path: str, title: str, description: str, token: str)
     metadata = json.dumps({
         "snippet": {
             "title": yt_title,
-            "description": description + "\n\n#Shorts",
+            "description": description,
             "categoryId": "17",
         },
         "status": {
@@ -446,12 +477,18 @@ def main() -> None:
         log.info(f"{len(new_videos)} neues Video(s) gefunden")
         new_videos.reverse()
 
+        posted_ids: list[str] = state.setdefault("posted_ids", [])
+
         for video in new_videos:
             video_id    = video["id"]
             raw_caption = video["description"]
             caption     = process_caption(raw_caption)
             video_url   = video["url"]
             log.info(f"Verarbeite {video_id}: {raw_caption[:60]!r}")
+
+            if video_id in posted_ids:
+                log.info(f"Duplikat übersprungen: {video_id}")
+                continue
 
             # Eigenes Verzeichnis pro Video → keine Konflikte
             work_dir = str(Path(base_dir) / video_id)
@@ -483,13 +520,16 @@ def main() -> None:
                 if yt_token:
                     try:
                         title_text = raw_caption.split("#")[0].strip() or "New Short"
-                        yt_video_id = upload_to_youtube(video_path, title_text, caption, yt_token)
+                        yt_desc = youtube_description(raw_caption)
+                        yt_video_id = upload_to_youtube(video_path, title_text, yt_desc, yt_token)
                         log.info(f"✅ YouTube Short: {yt_video_id}")
                     except Exception as e:
                         log.error(f"YouTube fehlgeschlagen: {e}", exc_info=True)
                         telegram(f"⚠️ YouTube fehlgeschlagen für {video_id}: {e}")
 
                 state["last_video_id"] = video_id
+                posted_ids.append(video_id)
+                state["posted_ids"] = posted_ids[-100:]  # max 100 IDs behalten
                 write_state(state)
 
                 yt_line = f"\nYouTube: <code>{yt_video_id}</code>" if yt_video_id else ""
