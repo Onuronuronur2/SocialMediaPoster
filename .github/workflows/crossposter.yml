@@ -32,8 +32,6 @@ jobs:
 
       - name: Crossposter ausführen
         env:
-          TIKTOK_CLIENT_KEY:      ${{ secrets.TIKTOK_CLIENT_KEY }}
-          TIKTOK_CLIENT_SECRET:   ${{ secrets.TIKTOK_CLIENT_SECRET }}
           TIKTOK_USERNAME:        ${{ secrets.TIKTOK_USERNAME }}
           TIKTOK_COOKIES_B64:     ${{ secrets.TIKTOK_COOKIES_B64 }}
           INSTAGRAM_USER_ID:      ${{ secrets.INSTAGRAM_USER_ID }}
