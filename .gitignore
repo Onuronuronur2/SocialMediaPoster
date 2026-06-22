@@ -1,5 +1,6 @@
 .env
-*.txt
+cookies.txt
+!requirements.txt
 !.env.example
 __pycache__/
 *.pyc
