@@ -1,0 +1,47 @@
+name: TikTok → Instagram Crossposter
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"   # alle 20 Minuten
+  workflow_dispatch:           # manueller Trigger zum Testen
+
+# Nötig damit der Job temporäre GitHub Releases erstellen kann (Video-Hosting für Instagram)
+permissions:
+  contents: write
+
+jobs:
+  crossposter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: yt-dlp auf aktuellste Version bringen
+        run: yt-dlp -U || true   # nicht kritisch, Fehler ignorieren
+
+      - name: Crossposter ausführen
+        env:
+          TIKTOK_CLIENT_KEY:      ${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET:   ${{ secrets.TIKTOK_CLIENT_SECRET }}
+          TIKTOK_USERNAME:        ${{ secrets.TIKTOK_USERNAME }}
+          TIKTOK_COOKIES_B64:     ${{ secrets.TIKTOK_COOKIES_B64 }}
+          INSTAGRAM_USER_ID:      ${{ secrets.INSTAGRAM_USER_ID }}
+          INSTAGRAM_APP_ID:       ${{ secrets.INSTAGRAM_APP_ID }}
+          INSTAGRAM_APP_SECRET:   ${{ secrets.INSTAGRAM_APP_SECRET }}
+          GIST_TOKEN:             ${{ secrets.GIST_TOKEN }}
+          GIST_ID:                ${{ secrets.GIST_ID }}
+          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          # GITHUB_TOKEN und GITHUB_REPOSITORY werden automatisch von Actions gesetzt
+        run: python scripts/main.py
