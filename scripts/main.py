@@ -175,26 +175,68 @@ def get_profile_videos(cookie_file: str, limit: int = 10) -> list[dict]:
     return videos
 
 
+def _ffmpeg(args: list[str]) -> None:
+    result = subprocess.run(args, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg fehlgeschlagen: {result.stderr.decode()}")
+
+
+def _download_slide_images(video_url: str, cookie_file: str, work_dir: str) -> list[str]:
+    """
+    Versucht alle Slide-Bilder einer TikTok-Slideshow herunterzuladen.
+    Gibt sortierte Liste von Bildpfaden zurück (leer wenn kein Slideshow).
+    """
+    ydl_info_opts = {
+        "cookiefile": cookie_file,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+    }
+    with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+    thumbnails = info.get("thumbnails", []) if info else []
+    # TikTok Slideshow-Bilder haben typischerweise eine eigene URL pro Slide
+    # Wir filtern auf Bilder mit signifikanter Auflösung (keine Mini-Previews)
+    slides = [
+        t for t in thumbnails
+        if t.get("url") and (t.get("width", 0) >= 200 or t.get("height", 0) >= 200)
+    ]
+
+    if len(slides) <= 1:
+        return []  # Kein Slideshow oder nur Cover
+
+    paths = []
+    for i, slide in enumerate(slides):
+        url = slide["url"]
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            path = str(Path(work_dir) / f"slide_{i:03d}.jpg")
+            Path(path).write_bytes(r.content)
+            paths.append(path)
+        except Exception as e:
+            log.warning(f"Slide {i} konnte nicht geladen werden: {e}")
+
+    return sorted(paths)
+
+
 def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     """
-    Lädt TikTok-Inhalt in work_dir herunter.
-    - Normales Video → video.mp4
-    - Foto-Post/Slideshow → Thumbnail + Audio per ffmpeg zu 7s-MP4
-    Jedes Video bekommt ein eigenes work_dir (kein Konflikt zwischen Videos).
+    Lädt TikTok-Inhalt herunter:
+    - Normales Video      → video.mp4
+    - Einzelnes Foto      → Thumbnail + Audio → 7s MP4
+    - Slideshow           → alle Slides + Audio → je 2.5s pro Bild
     """
     out_tpl = str(Path(work_dir) / "video.%(ext)s")
     ydl_opts = {
         "cookiefile": cookie_file,
-        # Beste verfügbare Qualität ohne Codec-Einschränkung
         "format": "bestvideo+bestaudio/best",
         "outtmpl": out_tpl,
         "merge_output_format": "mp4",
         "writethumbnail": True,
         "convert_thumbnails": "jpg",
-        # Falls ffmpeg konvertieren muss: maximale Qualität
-        "postprocessor_args": {
-            "ffmpeg": ["-crf", "18", "-preset", "slow"]
-        },
+        "postprocessor_args": {"ffmpeg": ["-crf", "18", "-preset", "slow"]},
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 60,
@@ -202,29 +244,59 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
 
-    log.info(f"Dateien in work_dir: {[f.name for f in Path(work_dir).iterdir()]}")
+    log.info(f"Dateien: {[f.name for f in Path(work_dir).iterdir()]}")
 
-    # Normales Video
+    # ── Normales Video ────────────────────────────────────────────────────────
     if (Path(work_dir) / "video.mp4").exists():
         return str(Path(work_dir) / "video.mp4")
 
-    # Foto-Post: Audio vorhanden?
+    # ── Foto / Slideshow: Audio muss vorhanden sein ───────────────────────────
     audio_files = list(Path(work_dir).glob("video.mp3"))
     if not audio_files:
         raise FileNotFoundError(
-            f"Kein Video/Audio gefunden: {[f.name for f in Path(work_dir).iterdir()]}"
+            f"Kein Video/Audio: {[f.name for f in Path(work_dir).iterdir()]}"
         )
-
     audio = str(audio_files[0])
     output_mp4 = str(Path(work_dir) / "output.mp4")
+
+    # ── Slideshow: alle Slides herunterladen ──────────────────────────────────
+    slide_paths = _download_slide_images(video_url, cookie_file, work_dir)
+
+    if len(slide_paths) > 1:
+        log.info(f"Slideshow erkannt: {len(slide_paths)} Bilder à 2.5s")
+        filelist = str(Path(work_dir) / "filelist.txt")
+        with open(filelist, "w") as f:
+            for p in slide_paths:
+                f.write(f"file '{p}'\n")
+                f.write("duration 2.5\n")
+            f.write(f"file '{slide_paths[-1]}'\n")  # letztes Bild nochmal für ffmpeg-concat
+
+        _ffmpeg([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", filelist,
+            "-i", audio,
+            "-vf", (
+                "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+            ),
+            "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+            output_mp4,
+        ])
+        return output_mp4
+
+    # ── Einzelnes Foto ────────────────────────────────────────────────────────
     thumb_files = [
         f for f in Path(work_dir).iterdir()
         if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+        and f.name != "filelist.txt"
     ]
 
     if thumb_files:
-        log.info(f"Foto-Post → {thumb_files[0].name} + Audio → 7s MP4")
-        result = subprocess.run([
+        log.info(f"Einzelfoto → 7s MP4")
+        _ffmpeg([
             "ffmpeg", "-y",
             "-loop", "1", "-i", str(thumb_files[0]),
             "-i", audio,
@@ -234,12 +306,10 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             output_mp4,
-        ], capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg fehlgeschlagen: {result.stderr.decode()}")
+        ])
     else:
-        log.info("Foto-Post ohne Thumbnail → schwarzes Bild + Audio")
-        result = subprocess.run([
+        log.info("Foto ohne Bild → schwarzes Bild + Audio")
+        _ffmpeg([
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30",
             "-i", audio,
@@ -247,9 +317,7 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
             "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
             "-pix_fmt", "yuv420p",
             output_mp4,
-        ], capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg fehlgeschlagen: {result.stderr.decode()}")
+        ])
 
     return output_mp4
 
