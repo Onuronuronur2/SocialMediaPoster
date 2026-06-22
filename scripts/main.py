@@ -40,8 +40,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 GIST_FILENAME = "state.json"
-GRAPH_API = "https://graph.facebook.com/v21.0"
-IG_GRAPH  = "https://graph.instagram.com"
+IG_GRAPH  = "https://graph.instagram.com/v21.0"
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -204,7 +203,7 @@ def refresh_instagram_token(access_token: str) -> str:
 
 def create_instagram_container(video_url: str, caption: str, access_token: str) -> str:
     r = requests.post(
-        f"{GRAPH_API}/{INSTAGRAM_USER_ID}/media",
+        f"{IG_GRAPH}/{INSTAGRAM_USER_ID}/media",
         params={"access_token": access_token},
         json={
             "media_type": "REELS",
@@ -223,7 +222,7 @@ def wait_for_container(container_id: str, access_token: str, max_wait: int = 600
     deadline = time.time() + max_wait
     while time.time() < deadline:
         r = requests.get(
-            f"{GRAPH_API}/{container_id}",
+            f"{IG_GRAPH}/{container_id}",
             params={"fields": "status_code,status", "access_token": access_token},
             timeout=15,
         )
@@ -241,7 +240,7 @@ def wait_for_container(container_id: str, access_token: str, max_wait: int = 600
 
 def publish_instagram_reel(container_id: str, access_token: str) -> str:
     r = requests.post(
-        f"{GRAPH_API}/{INSTAGRAM_USER_ID}/media_publish",
+        f"{IG_GRAPH}/{INSTAGRAM_USER_ID}/media_publish",
         params={"access_token": access_token},
         json={"creation_id": container_id},
         timeout=30,
