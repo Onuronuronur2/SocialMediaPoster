@@ -41,5 +41,6 @@ jobs:
           GIST_ID:                ${{ secrets.GIST_ID }}
           TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
-          # GITHUB_TOKEN und GITHUB_REPOSITORY werden automatisch von Actions gesetzt
+          GITHUB_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:      ${{ github.repository }}
         run: python scripts/main.py
