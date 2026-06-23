@@ -160,7 +160,7 @@ def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) ->
             )
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             contents=[video_file, prompt],
         )
 
@@ -634,7 +634,7 @@ def main() -> None:
             Path(work_dir).mkdir()
 
             release_id: int | None = None
-            tag = f"tmp-vid-{video_id}"
+            tag = f"tmp-vid-{video_id}-{int(time.time())}"
 
             try:
                 log.info("Lade Video herunter...")
