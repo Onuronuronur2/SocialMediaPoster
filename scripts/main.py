@@ -543,7 +543,7 @@ def create_instagram_container(video_url: str, caption: str, token: str) -> str:
         f"{IG_GRAPH}/{INSTAGRAM_USER_ID}/media",
         params={"access_token": token},
         json={"media_type": "REELS", "video_url": video_url,
-              "caption": caption, "share_to_feed": True},
+              "caption": caption, "share_to_feed": False},
         timeout=30,
     )
     if r.status_code != 200:
