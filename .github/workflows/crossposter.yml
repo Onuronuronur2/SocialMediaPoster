@@ -1,9 +1,9 @@
 name: TikTok → Instagram Crossposter
 
 on:
-  schedule:
-    - cron: "*/20 * * * *"   # alle 20 Minuten
-  workflow_dispatch:           # manueller Trigger zum Testen
+  # schedule:
+  #   - cron: "*/20 * * * *"   # deaktiviert – cron-job.org übernimmt
+  workflow_dispatch:           # wird von cron-job.org alle 15 Min ausgelöst
 
 # Nötig damit der Job temporäre GitHub Releases erstellen kann (Video-Hosting für Instagram)
 permissions:
