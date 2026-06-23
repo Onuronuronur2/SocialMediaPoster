@@ -128,15 +128,16 @@ def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) ->
     """Lässt Gemini das Video analysieren und schreibt eine plattformgerechte Caption.
     Gibt bei Fehler den bereinigten Original-Text zurück (kein Absturz, kein Kosten-Risiko)."""
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
+        from google import genai as google_genai
+
+        client = google_genai.Client(api_key=GEMINI_API_KEY)
 
         log.info(f"Gemini: Video hochladen ({platform})...")
-        video_file = genai.upload_file(video_path, mime_type="video/mp4")
+        video_file = client.files.upload(file=video_path)
 
         while video_file.state.name == "PROCESSING":
             time.sleep(5)
-            video_file = genai.get_file(video_file.name)
+            video_file = client.files.get(name=video_file.name)
 
         if video_file.state.name != "ACTIVE":
             raise RuntimeError(f"Gemini File-Status: {video_file.state.name}")
@@ -158,11 +159,13 @@ def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) ->
                 f"Etwas informativer als Instagram, aber locker. Keine Hashtags, kein Footer."
             )
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content([video_file, prompt])
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[video_file, prompt],
+        )
 
         try:
-            genai.delete_file(video_file.name)
+            client.files.delete(name=video_file.name)
         except Exception:
             pass
 
