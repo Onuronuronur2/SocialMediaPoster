@@ -45,7 +45,8 @@ YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_DAILY_LIMIT  = 1400  # kostenloses Limit: 1.500/Tag – wir bleiben 100 darunter
 
 GIST_FILENAME = "state.json"
 IG_GRAPH      = "https://graph.instagram.com/v21.0"
@@ -111,8 +112,21 @@ def youtube_description(raw: str) -> str:
     return build_youtube_description(caption_text, raw)
 
 
+def _gemini_quota_ok(state: dict) -> bool:
+    """Prüft ob noch genug Gemini-Requests übrig sind (min. 2 für IG + YT)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get("gemini_date") != today:
+        state["gemini_calls"] = 0
+        state["gemini_date"] = today
+    used = state.get("gemini_calls", 0)
+    remaining = GEMINI_DAILY_LIMIT - used
+    log.info(f"Gemini Quota: {used}/{GEMINI_DAILY_LIMIT} heute genutzt ({remaining} übrig)")
+    return remaining >= 2
+
+
 def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) -> str:
-    """Lässt Gemini das Video analysieren und schreibt eine plattformgerechte Caption."""
+    """Lässt Gemini das Video analysieren und schreibt eine plattformgerechte Caption.
+    Gibt bei Fehler den bereinigten Original-Text zurück (kein Absturz, kein Kosten-Risiko)."""
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
@@ -624,14 +638,19 @@ def main() -> None:
                 video_path = download_video(video_url, cookie_file, work_dir)
                 log.info(f"Download OK: {video_path}")
 
-                # Caption generieren – Gemini analysiert das Video, Fallback auf Original-Logik
-                if GEMINI_API_KEY:
+                # Caption generieren
+                # Footer & Hashtags werden IMMER angehängt (build_instagram_caption / build_youtube_description)
+                # Gemini liefert nur den Haupttext – bei Quota-Erschöpfung oder Fehler: Fallback
+                if GEMINI_API_KEY and _gemini_quota_ok(state):
                     ig_text = generate_caption_gemini(video_path, raw_caption, "instagram")
                     yt_text = generate_caption_gemini(video_path, raw_caption, "youtube")
+                    state["gemini_calls"] = state.get("gemini_calls", 0) + 2
                     caption = build_instagram_caption(ig_text, raw_caption)
                     yt_desc = build_youtube_description(yt_text, raw_caption)
                     title_text = ig_text.split("\n")[0][:95] or raw_caption.split("#")[0].strip() or "New Short"
                 else:
+                    if GEMINI_API_KEY:
+                        log.info("Gemini Quota erschöpft → Fallback auf Original-Caption")
                     caption = process_caption(raw_caption)
                     yt_desc = youtube_description(raw_caption)
                     title_text = raw_caption.split("#")[0].strip() or "New Short"
