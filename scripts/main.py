@@ -276,54 +276,148 @@ def _ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg fehlgeschlagen: {result.stderr.decode()}")
 
 
-def _download_slide_images(video_url: str, cookie_file: str, work_dir: str) -> list[str]:
-    """
-    Versucht alle Slide-Bilder einer TikTok-Slideshow herunterzuladen.
-    Gibt sortierte Liste von Bildpfaden zurück (leer wenn kein Slideshow).
-    """
-    ydl_info_opts = {
-        "cookiefile": cookie_file,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-    }
-    with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-
-    thumbnails = info.get("thumbnails", []) if info else []
-    # TikTok Slideshow-Bilder haben typischerweise eine eigene URL pro Slide
-    # Wir filtern auf Bilder mit signifikanter Auflösung (keine Mini-Previews)
-    slides = [
-        t for t in thumbnails
-        if t.get("url") and (t.get("width", 0) >= 200 or t.get("height", 0) >= 200)
-    ]
-
-    if len(slides) <= 1:
-        return []  # Kein Slideshow oder nur Cover
-
+def _download_urls_as_slides(urls: list, work_dir: str) -> list[str]:
+    """Lädt URLs als slide_000.jpg, slide_001.jpg usw. herunter."""
     paths = []
-    for i, slide in enumerate(slides):
-        url = slide["url"]
+    for i, url in enumerate([u for u in urls if u]):
         try:
-            r = requests.get(url, timeout=30)
+            r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
+            if len(r.content) < 500:
+                continue
             path = str(Path(work_dir) / f"slide_{i:03d}.jpg")
             Path(path).write_bytes(r.content)
             paths.append(path)
         except Exception as e:
-            log.warning(f"Slide {i} konnte nicht geladen werden: {e}")
-
+            log.warning(f"Slide {i} fehlgeschlagen: {e}")
     return sorted(paths)
+
+
+def _detect_slideshow(info: dict, work_dir: str) -> list[str]:
+    """
+    Erkennt TikTok-Slideshow aus dem yt-dlp Info-Dict (4 Methoden) und lädt alle Bilder.
+    Gibt sortierte Bildpfade zurück, oder [] wenn kein Slideshow.
+    """
+    if not info:
+        return []
+
+    formats   = info.get("formats", [])
+    entries   = info.get("entries") or []
+    thumbnails = info.get("thumbnails", [])
+
+    log.info(
+        f"Slideshow-Check: _type={info.get('_type', '?')}, "
+        f"formats={len(formats)}, entries={len(entries)}, thumbnails={len(thumbnails)}"
+    )
+
+    # Methode 1: Playlist – jede Entry ist ein Slide
+    if len(entries) > 1:
+        urls = [e.get("url") or e.get("original_url") for e in entries if e]
+        paths = _download_urls_as_slides(urls, work_dir)
+        if len(paths) > 1:
+            log.info(f"Slideshow (entries): {len(paths)} Bilder")
+            return paths
+
+    # Methode 2: Bild-Formate mit vcodec=none UND acodec=none
+    image_fmts = [
+        f for f in formats
+        if f.get("vcodec") == "none" and f.get("acodec") == "none" and f.get("url")
+    ]
+    if len(image_fmts) > 1:
+        paths = _download_urls_as_slides([f["url"] for f in image_fmts], work_dir)
+        if len(paths) > 1:
+            log.info(f"Slideshow (image-formats): {len(paths)} Bilder")
+            return paths
+
+    # Methode 3: Formate mit Bild-Extension
+    ext_fmts = [
+        f for f in formats
+        if f.get("ext") in ("jpg", "jpeg", "png", "webp") and f.get("url")
+    ]
+    if len(ext_fmts) > 1:
+        paths = _download_urls_as_slides([f["url"] for f in ext_fmts], work_dir)
+        if len(paths) > 1:
+            log.info(f"Slideshow (image-ext): {len(paths)} Bilder")
+            return paths
+
+    # Methode 4: Hochauflösende Thumbnails mit unterschiedlichen URLs
+    unique_thumb_urls = list(dict.fromkeys(
+        t["url"] for t in thumbnails
+        if t.get("url") and (t.get("width", 0) >= 300 or t.get("height", 0) >= 300)
+    ))
+    if len(unique_thumb_urls) > 1:
+        paths = _download_urls_as_slides(unique_thumb_urls, work_dir)
+        if len(paths) > 1:
+            log.info(f"Slideshow (thumbnails): {len(paths)} Bilder")
+            return paths
+
+    log.info("Kein Slideshow erkannt → normaler Download")
+    return []
+
+
+def _build_slideshow_video(slide_paths: list[str], audio_path: str, work_dir: str) -> str:
+    """Stitcht Slide-Bilder + Audio zu einem MP4 (je 2.5s pro Bild)."""
+    output_mp4 = str(Path(work_dir) / "output.mp4")
+    filelist   = str(Path(work_dir) / "filelist.txt")
+    with open(filelist, "w") as f:
+        for p in slide_paths:
+            f.write(f"file '{p}'\n")
+            f.write("duration 2.5\n")
+        f.write(f"file '{slide_paths[-1]}'\n")
+
+    _ffmpeg([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", filelist,
+        "-i", audio_path,
+        "-vf", (
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+        ),
+        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+        "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+        output_mp4,
+    ])
+    return output_mp4
 
 
 def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     """
     Lädt TikTok-Inhalt herunter:
-    - Normales Video      → video.mp4
-    - Einzelnes Foto      → Thumbnail + Audio → 7s MP4
-    - Slideshow           → alle Slides + Audio → je 2.5s pro Bild
+    - Normales Video  → video.mp4
+    - Einzelnes Foto  → Thumbnail + Audio → 7s MP4
+    - Slideshow       → alle Slides + Audio → je 2.5s pro Bild
+    Slideshow wird VOR dem Haupt-Download erkannt, damit kein falsches 7s-Video entsteht.
     """
-    out_tpl = str(Path(work_dir) / "video.%(ext)s")
+    # ── Schritt 1: Info holen (ohne Download) → Slideshow-Erkennung ──────────
+    with yt_dlp.YoutubeDL({
+        "cookiefile": cookie_file, "quiet": True,
+        "no_warnings": True, "socket_timeout": 30,
+    }) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+    slide_paths = _detect_slideshow(info or {}, work_dir)
+
+    # ── Schritt 2a: Slideshow ─────────────────────────────────────────────────
+    if len(slide_paths) > 1:
+        log.info(f"Slideshow: {len(slide_paths)} Bilder à 2.5s – lade Audio separat...")
+        audio_tpl = str(Path(work_dir) / "audio.%(ext)s")
+        with yt_dlp.YoutubeDL({
+            "cookiefile": cookie_file,
+            "format": "bestaudio",
+            "outtmpl": audio_tpl,
+            "quiet": True, "no_warnings": True, "socket_timeout": 60,
+        }) as ydl:
+            ydl.download([video_url])
+
+        audio_files = list(Path(work_dir).glob("audio.*"))
+        if not audio_files:
+            raise FileNotFoundError("Kein Audio für Slideshow gefunden")
+        return _build_slideshow_video(slide_paths, str(audio_files[0]), work_dir)
+
+    # ── Schritt 2b: Normaler Download (Video oder Einzelfoto) ────────────────
+    out_tpl  = str(Path(work_dir) / "video.%(ext)s")
     ydl_opts = {
         "cookiefile": cookie_file,
         "format": "bestvideo+bestaudio/best",
@@ -341,56 +435,23 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
 
     log.info(f"Dateien: {[f.name for f in Path(work_dir).iterdir()]}")
 
-    # ── Normales Video ────────────────────────────────────────────────────────
     if (Path(work_dir) / "video.mp4").exists():
         return str(Path(work_dir) / "video.mp4")
 
-    # ── Foto / Slideshow: Audio muss vorhanden sein ───────────────────────────
     audio_files = list(Path(work_dir).glob("video.mp3"))
     if not audio_files:
-        raise FileNotFoundError(
-            f"Kein Video/Audio: {[f.name for f in Path(work_dir).iterdir()]}"
-        )
-    audio = str(audio_files[0])
+        raise FileNotFoundError(f"Kein Video/Audio: {[f.name for f in Path(work_dir).iterdir()]}")
+    audio      = str(audio_files[0])
     output_mp4 = str(Path(work_dir) / "output.mp4")
-
-    # ── Slideshow: alle Slides herunterladen ──────────────────────────────────
-    slide_paths = _download_slide_images(video_url, cookie_file, work_dir)
-
-    if len(slide_paths) > 1:
-        log.info(f"Slideshow erkannt: {len(slide_paths)} Bilder à 2.5s")
-        filelist = str(Path(work_dir) / "filelist.txt")
-        with open(filelist, "w") as f:
-            for p in slide_paths:
-                f.write(f"file '{p}'\n")
-                f.write("duration 2.5\n")
-            f.write(f"file '{slide_paths[-1]}'\n")  # letztes Bild nochmal für ffmpeg-concat
-
-        _ffmpeg([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", filelist,
-            "-i", audio,
-            "-vf", (
-                "scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
-            ),
-            "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-            "-c:a", "aac", "-b:a", "192k",
-            "-pix_fmt", "yuv420p",
-            "-shortest",
-            output_mp4,
-        ])
-        return output_mp4
 
     # ── Einzelnes Foto ────────────────────────────────────────────────────────
     thumb_files = [
         f for f in Path(work_dir).iterdir()
         if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
-        and f.name != "filelist.txt"
     ]
 
     if thumb_files:
-        log.info(f"Einzelfoto → 7s MP4")
+        log.info("Einzelfoto → 7s MP4")
         _ffmpeg([
             "ffmpeg", "-y",
             "-loop", "1", "-i", str(thumb_files[0]),
