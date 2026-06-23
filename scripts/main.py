@@ -45,6 +45,8 @@ YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
 GIST_FILENAME = "state.json"
 IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
@@ -80,31 +82,84 @@ def _extract(raw: str) -> tuple[str, list[str]]:
     return caption_text, unique
 
 
-def process_caption(raw: str) -> str:
-    """Instagram-Caption: max 5 Hashtags aus Pool, fester Footer."""
-    caption_text, unique = _extract(raw)
-
+def _build_hashtags(raw: str, suffix: str = "") -> str:
+    _, unique = _extract(raw)
     for tag in HASHTAG_POOL:
         if len(unique) >= 5:
             break
         if tag.lower() not in {h.lower() for h in unique}:
             unique.append(tag)
+    tags = " ".join(unique[:5])
+    return f"{tags} {suffix}".strip() if suffix else tags
 
-    return f"{caption_text}\n\n{INSTAGRAM_FOOTER}\n\n{' '.join(unique[:5])}"
+
+def build_instagram_caption(main_text: str, raw: str) -> str:
+    return f"{main_text}\n\n{INSTAGRAM_FOOTER}\n\n{_build_hashtags(raw)}"
+
+
+def build_youtube_description(main_text: str, raw: str) -> str:
+    return f"{main_text}\n\n{YOUTUBE_SOCIALS}\n\n{_build_hashtags(raw, '#Shorts')}"
+
+
+def process_caption(raw: str) -> str:
+    caption_text, _ = _extract(raw)
+    return build_instagram_caption(caption_text, raw)
 
 
 def youtube_description(raw: str) -> str:
-    """YouTube-Beschreibung: Text, Social-Links, Hashtags + #Shorts."""
-    caption_text, unique = _extract(raw)
+    caption_text, _ = _extract(raw)
+    return build_youtube_description(caption_text, raw)
 
-    for tag in HASHTAG_POOL:
-        if len(unique) >= 5:
-            break
-        if tag.lower() not in {h.lower() for h in unique}:
-            unique.append(tag)
 
-    hashtag_line = " ".join(unique[:5]) + " #Shorts"
-    return f"{caption_text}\n\n{YOUTUBE_SOCIALS}\n\n{hashtag_line}"
+def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) -> str:
+    """Lässt Gemini das Video analysieren und schreibt eine plattformgerechte Caption."""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+
+        log.info(f"Gemini: Video hochladen ({platform})...")
+        video_file = genai.upload_file(video_path, mime_type="video/mp4")
+
+        while video_file.state.name == "PROCESSING":
+            time.sleep(5)
+            video_file = genai.get_file(video_file.name)
+
+        if video_file.state.name != "ACTIVE":
+            raise RuntimeError(f"Gemini File-Status: {video_file.state.name}")
+
+        if platform == "instagram":
+            prompt = (
+                f"Du analysierst ein Video für Instagram Reels (@onursportlich).\n"
+                f"Kanal: Fitness, Sport, deutsche Memes – junges deutsches Publikum.\n"
+                f"Originaler TikTok-Text: \"{raw_caption}\"\n\n"
+                f"Schreibe NUR den Caption-Haupttext auf Deutsch (1-2 kurze Sätze).\n"
+                f"Ton: locker, authentisch, zum Video passend. Keine Hashtags, kein Footer."
+            )
+        else:
+            prompt = (
+                f"Du analysierst ein Video für YouTube Shorts (@onursportlich).\n"
+                f"Kanal: Fitness, Sport, deutsche Memes – junges deutsches Publikum.\n"
+                f"Originaler TikTok-Text: \"{raw_caption}\"\n\n"
+                f"Schreibe NUR die Beschreibung auf Deutsch (2-3 Sätze).\n"
+                f"Etwas informativer als Instagram, aber locker. Keine Hashtags, kein Footer."
+            )
+
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([video_file, prompt])
+
+        try:
+            genai.delete_file(video_file.name)
+        except Exception:
+            pass
+
+        text = response.text.strip()
+        log.info(f"Gemini {platform}-Caption: {text[:80]!r}")
+        return text
+
+    except Exception as e:
+        log.warning(f"Gemini ({platform}) fehlgeschlagen: {e} → Fallback auf Original")
+        caption_text, _ = _extract(raw_caption)
+        return caption_text
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -550,7 +605,6 @@ def main() -> None:
         for video in new_videos:
             video_id    = video["id"]
             raw_caption = video["description"]
-            caption     = process_caption(raw_caption)
             video_url   = video["url"]
             log.info(f"Verarbeite {video_id}: {raw_caption[:60]!r}")
 
@@ -570,6 +624,18 @@ def main() -> None:
                 video_path = download_video(video_url, cookie_file, work_dir)
                 log.info(f"Download OK: {video_path}")
 
+                # Caption generieren – Gemini analysiert das Video, Fallback auf Original-Logik
+                if GEMINI_API_KEY:
+                    ig_text = generate_caption_gemini(video_path, raw_caption, "instagram")
+                    yt_text = generate_caption_gemini(video_path, raw_caption, "youtube")
+                    caption = build_instagram_caption(ig_text, raw_caption)
+                    yt_desc = build_youtube_description(yt_text, raw_caption)
+                    title_text = ig_text.split("\n")[0][:95] or raw_caption.split("#")[0].strip() or "New Short"
+                else:
+                    caption = process_caption(raw_caption)
+                    yt_desc = youtube_description(raw_caption)
+                    title_text = raw_caption.split("#")[0].strip() or "New Short"
+
                 log.info("Lade auf GitHub Release hoch...")
                 public_url, release_id = upload_to_github_release(video_path, tag)
                 log.info(f"URL: {public_url}")
@@ -587,8 +653,6 @@ def main() -> None:
                 yt_video_id = None
                 if yt_token:
                     try:
-                        title_text = raw_caption.split("#")[0].strip() or "New Short"
-                        yt_desc = youtube_description(raw_caption)
                         yt_video_id = upload_to_youtube(video_path, title_text, yt_desc, yt_token)
                         log.info(f"✅ YouTube Short: {yt_video_id}")
                     except Exception as e:
