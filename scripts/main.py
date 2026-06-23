@@ -171,7 +171,7 @@ def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) ->
             )
 
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash-lite",
             contents=[video_file, prompt],
         )
 
