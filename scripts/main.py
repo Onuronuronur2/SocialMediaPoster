@@ -48,6 +48,8 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_DAILY_LIMIT  = 1400  # kostenloses Limit: 1.500/Tag – wir bleiben 100 darunter
 
+_gemini_quota_exceeded = False  # wird auf True gesetzt sobald 429 kommt → restliche Calls überspringen
+
 GIST_FILENAME = "state.json"
 IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
@@ -127,6 +129,15 @@ def _gemini_quota_ok(state: dict) -> bool:
 def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) -> str:
     """Lässt Gemini das Video analysieren und schreibt eine plattformgerechte Caption.
     Gibt bei Fehler den bereinigten Original-Text zurück (kein Absturz, kein Kosten-Risiko)."""
+    global _gemini_quota_exceeded
+
+    if _gemini_quota_exceeded:
+        log.info(f"Gemini ({platform}) übersprungen – Quota in diesem Run erschöpft")
+        caption_text, _ = _extract(raw_caption)
+        return caption_text
+
+    client = None
+    video_file = None
     try:
         from google import genai as google_genai
 
@@ -174,7 +185,19 @@ def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) ->
         return text
 
     except Exception as e:
-        log.warning(f"Gemini ({platform}) fehlgeschlagen: {e} → Fallback auf Original")
+        # Hochgeladene Datei aufräumen falls vorhanden
+        if client is not None and video_file is not None:
+            try:
+                client.files.delete(name=video_file.name)
+            except Exception:
+                pass
+
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            _gemini_quota_exceeded = True
+            log.warning("Gemini Quota erschöpft → alle weiteren Gemini-Calls in diesem Run übersprungen")
+        else:
+            log.warning(f"Gemini ({platform}) fehlgeschlagen: {e} → Fallback auf Original")
+
         caption_text, _ = _extract(raw_caption)
         return caption_text
 
