@@ -10,6 +10,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import http.cookiejar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -293,26 +294,128 @@ def _download_urls_as_slides(urls: list, work_dir: str) -> list[str]:
     return sorted(paths)
 
 
-def _detect_slideshow(info: dict, work_dir: str) -> list[str]:
+def _extract_json_object(text: str, start: int) -> dict | None:
+    """Extrahiert das JSON-Objekt das bei text[start] == '{' beginnt (Brace-Matching)."""
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except Exception:
+                    return None
+    return None
+
+
+def _slides_from_webpage(video_url: str, cookie_file: str, work_dir: str) -> list[str]:
     """
-    Erkennt TikTok-Slideshow aus dem yt-dlp Info-Dict (4 Methoden) und lädt alle Bilder.
+    Primäre Slideshow-Erkennung: lädt die TikTok-Seite und parst das
+    eingebettete 'imagePost'-JSON mit allen Slide-Bild-URLs.
+    """
+    try:
+        jar = http.cookiejar.MozillaCookieJar(cookie_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+
+        r = requests.get(
+            video_url,
+            cookies=jar,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+            },
+            timeout=30,
+            allow_redirects=True,
+        )
+        r.raise_for_status()
+        html = r.text
+
+        idx = html.find('"imagePost"')
+        if idx == -1:
+            log.info("Webpage-Check: kein 'imagePost' im HTML → kein Slideshow")
+            return []
+
+        brace = html.find("{", idx + len('"imagePost"'))
+        image_post = _extract_json_object(html, brace) if brace != -1 else None
+        if not image_post or not image_post.get("images"):
+            log.warning("Webpage-Check: 'imagePost' gefunden, aber Parsing fehlgeschlagen")
+            return []
+
+        urls = []
+        for img in image_post["images"]:
+            url_list = (img.get("imageURL") or {}).get("urlList") or []
+            if url_list:
+                urls.append(url_list[0])
+
+        log.info(f"Webpage-Check: imagePost mit {len(urls)} Bildern gefunden")
+        return _download_urls_as_slides(urls, work_dir)
+
+    except Exception as e:
+        log.warning(f"Webpage-Check fehlgeschlagen: {e}")
+        return []
+
+
+def _detect_slideshow(info: dict, video_url: str, cookie_file: str, work_dir: str) -> list[str]:
+    """
+    Erkennt TikTok-Slideshow und lädt alle Bilder herunter.
+    Primär: imagePost-JSON aus der TikTok-Webseite.
+    Fallback: yt-dlp Info-Dict (entries / Bild-Formate / Thumbnails).
     Gibt sortierte Bildpfade zurück, oder [] wenn kein Slideshow.
     """
+    # Methode 0 (primär): TikTok-Webseite parsen
+    paths = _slides_from_webpage(video_url, cookie_file, work_dir)
+    if len(paths) > 1:
+        log.info(f"Slideshow (webpage): {len(paths)} Bilder")
+        return paths
+
     if not info:
         return []
 
-    formats   = info.get("formats", [])
-    entries   = info.get("entries") or []
+    formats    = info.get("formats", [])
+    entries    = info.get("entries") or []
     thumbnails = info.get("thumbnails", [])
 
     log.info(
-        f"Slideshow-Check: _type={info.get('_type', '?')}, "
+        f"Slideshow-Check (yt-dlp): _type={info.get('_type', '?')}, "
         f"formats={len(formats)}, entries={len(entries)}, thumbnails={len(thumbnails)}"
     )
 
     # Methode 1: Playlist – jede Entry ist ein Slide
     if len(entries) > 1:
-        urls = [e.get("url") or e.get("original_url") for e in entries if e]
+        urls = []
+        for e in entries:
+            if not e:
+                continue
+            entry_fmts = [
+                f for f in e.get("formats", [])
+                if f.get("url") and (
+                    f.get("ext") in ("jpg", "jpeg", "png", "webp")
+                    or (f.get("vcodec") == "none" and f.get("acodec") == "none")
+                )
+            ]
+            if entry_fmts:
+                urls.append(entry_fmts[-1]["url"])
+            else:
+                urls.append(e.get("url") or e.get("original_url"))
         paths = _download_urls_as_slides(urls, work_dir)
         if len(paths) > 1:
             log.info(f"Slideshow (entries): {len(paths)} Bilder")
@@ -340,25 +443,29 @@ def _detect_slideshow(info: dict, work_dir: str) -> list[str]:
             log.info(f"Slideshow (image-ext): {len(paths)} Bilder")
             return paths
 
-    # Methode 4: Hochauflösende Thumbnails mit unterschiedlichen URLs
-    unique_thumb_urls = list(dict.fromkeys(
-        t["url"] for t in thumbnails
-        if t.get("url") and (t.get("width", 0) >= 300 or t.get("height", 0) >= 300)
-    ))
-    if len(unique_thumb_urls) > 1:
-        paths = _download_urls_as_slides(unique_thumb_urls, work_dir)
-        if len(paths) > 1:
-            log.info(f"Slideshow (thumbnails): {len(paths)} Bilder")
-            return paths
-
     log.info("Kein Slideshow erkannt → normaler Download")
     return []
 
 
+def _audio_duration(path: str) -> float:
+    """Ermittelt die Audio-Länge in Sekunden via ffprobe (0.0 bei Fehler)."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
 def _build_slideshow_video(slide_paths: list[str], audio_path: str, work_dir: str) -> str:
-    """Stitcht Slide-Bilder + Audio zu einem MP4 (je 2.5s pro Bild)."""
+    """Stitcht Slide-Bilder + Audio zu einem MP4 (je 2.5s pro Bild).
+    Audio wird geloopt falls kürzer als die Slideshow, damit jedes Bild voll gezeigt wird."""
     output_mp4 = str(Path(work_dir) / "output.mp4")
     filelist   = str(Path(work_dir) / "filelist.txt")
+    total = len(slide_paths) * 2.5
     with open(filelist, "w") as f:
         for p in slide_paths:
             f.write(f"file '{p}'\n")
@@ -368,7 +475,7 @@ def _build_slideshow_video(slide_paths: list[str], audio_path: str, work_dir: st
     _ffmpeg([
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", filelist,
-        "-i", audio_path,
+        "-stream_loop", "-1", "-i", audio_path,
         "-vf", (
             "scale=1080:1920:force_original_aspect_ratio=decrease,"
             "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
@@ -376,7 +483,7 @@ def _build_slideshow_video(slide_paths: list[str], audio_path: str, work_dir: st
         "-c:v", "libx264", "-crf", "18", "-preset", "slow",
         "-c:a", "aac", "-b:a", "192k",
         "-pix_fmt", "yuv420p",
-        "-shortest",
+        "-t", f"{total}",
         output_mp4,
     ])
     return output_mp4
@@ -386,9 +493,9 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     """
     Lädt TikTok-Inhalt herunter:
     - Normales Video  → video.mp4
-    - Einzelnes Foto  → Thumbnail + Audio → 7s MP4
+    - Einzelnes Foto  → Bild + kompletter Sound → MP4 in Sound-Länge
     - Slideshow       → alle Slides + Audio → je 2.5s pro Bild
-    Slideshow wird VOR dem Haupt-Download erkannt, damit kein falsches 7s-Video entsteht.
+    Slideshow wird VOR dem Haupt-Download erkannt, damit kein falsches Einzelbild-Video entsteht.
     """
     # ── Schritt 1: Info holen (ohne Download) → Slideshow-Erkennung ──────────
     with yt_dlp.YoutubeDL({
@@ -397,7 +504,7 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     }) as ydl:
         info = ydl.extract_info(video_url, download=False)
 
-    slide_paths = _detect_slideshow(info or {}, work_dir)
+    slide_paths = _detect_slideshow(info or {}, video_url, cookie_file, work_dir)
 
     # ── Schritt 2a: Slideshow ─────────────────────────────────────────────────
     if len(slide_paths) > 1:
@@ -450,28 +557,31 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
         if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
     ]
 
+    # Sound-Länge bestimmt die Video-Länge (min. 3s wegen Instagram-Minimum)
+    duration = max(3.0, _audio_duration(audio))
+    log.info(f"Einzelfoto → MP4 in Sound-Länge ({duration:.1f}s)")
+
     if thumb_files:
-        log.info("Einzelfoto → 7s MP4")
         _ffmpeg([
             "ffmpeg", "-y",
             "-loop", "1", "-i", str(thumb_files[0]),
             "-i", audio,
-            "-t", "7",
             "-c:v", "libx264", "-tune", "stillimage",
             "-c:a", "aac", "-b:a", "192k",
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-t", f"{duration}",
             output_mp4,
         ])
     else:
-        log.info("Foto ohne Bild → schwarzes Bild + Audio")
+        log.info("Kein Bild gefunden → schwarzer Hintergrund")
         _ffmpeg([
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30",
             "-i", audio,
-            "-t", "7",
             "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
             "-pix_fmt", "yuv420p",
+            "-t", f"{duration}",
             output_mp4,
         ])
 
