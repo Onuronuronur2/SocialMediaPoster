@@ -46,11 +46,6 @@ YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 
-GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_DAILY_LIMIT  = 1400  # kostenloses Limit: 1.500/Tag – wir bleiben 100 darunter
-
-_gemini_quota_exceeded = False  # wird auf True gesetzt sobald 429 kommt → restliche Calls überspringen
-
 GIST_FILENAME = "state.json"
 IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
@@ -97,110 +92,16 @@ def _build_hashtags(raw: str, suffix: str = "") -> str:
     return f"{tags} {suffix}".strip() if suffix else tags
 
 
-def build_instagram_caption(main_text: str, raw: str) -> str:
-    return f"{main_text}\n\n{INSTAGRAM_FOOTER}\n\n{_build_hashtags(raw)}"
-
-
-def build_youtube_description(main_text: str, raw: str) -> str:
-    return f"{main_text}\n\n{YOUTUBE_SOCIALS}\n\n{_build_hashtags(raw, '#Shorts')}"
-
-
 def process_caption(raw: str) -> str:
+    """Instagram-Caption: Text, Footer, max 5 Hashtags (immer am Ende)."""
     caption_text, _ = _extract(raw)
-    return build_instagram_caption(caption_text, raw)
+    return f"{caption_text}\n\n{INSTAGRAM_FOOTER}\n\n{_build_hashtags(raw)}"
 
 
 def youtube_description(raw: str) -> str:
+    """YouTube-Beschreibung: Text, Social-Links, Hashtags + #Shorts (immer am Ende)."""
     caption_text, _ = _extract(raw)
-    return build_youtube_description(caption_text, raw)
-
-
-def _gemini_quota_ok(state: dict) -> bool:
-    """Prüft ob noch genug Gemini-Requests übrig sind (min. 2 für IG + YT)."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state.get("gemini_date") != today:
-        state["gemini_calls"] = 0
-        state["gemini_date"] = today
-    used = state.get("gemini_calls", 0)
-    remaining = GEMINI_DAILY_LIMIT - used
-    log.info(f"Gemini Quota: {used}/{GEMINI_DAILY_LIMIT} heute genutzt ({remaining} übrig)")
-    return remaining >= 2
-
-
-def generate_caption_gemini(video_path: str, raw_caption: str, platform: str) -> str:
-    """Lässt Gemini das Video analysieren und schreibt eine plattformgerechte Caption.
-    Gibt bei Fehler den bereinigten Original-Text zurück (kein Absturz, kein Kosten-Risiko)."""
-    global _gemini_quota_exceeded
-
-    if _gemini_quota_exceeded:
-        log.info(f"Gemini ({platform}) übersprungen – Quota in diesem Run erschöpft")
-        caption_text, _ = _extract(raw_caption)
-        return caption_text
-
-    client = None
-    video_file = None
-    try:
-        from google import genai as google_genai
-
-        client = google_genai.Client(api_key=GEMINI_API_KEY)
-
-        log.info(f"Gemini: Video hochladen ({platform})...")
-        video_file = client.files.upload(file=video_path)
-
-        while video_file.state.name == "PROCESSING":
-            time.sleep(5)
-            video_file = client.files.get(name=video_file.name)
-
-        if video_file.state.name != "ACTIVE":
-            raise RuntimeError(f"Gemini File-Status: {video_file.state.name}")
-
-        if platform == "instagram":
-            prompt = (
-                f"Du analysierst ein Video für Instagram Reels (@onursportlich).\n"
-                f"Kanal: Fitness, Sport, deutsche Memes – junges deutsches Publikum.\n"
-                f"Originaler TikTok-Text: \"{raw_caption}\"\n\n"
-                f"Schreibe NUR den Caption-Haupttext auf Deutsch (1-2 kurze Sätze).\n"
-                f"Ton: locker, authentisch, zum Video passend. Keine Hashtags, kein Footer."
-            )
-        else:
-            prompt = (
-                f"Du analysierst ein Video für YouTube Shorts (@onursportlich).\n"
-                f"Kanal: Fitness, Sport, deutsche Memes – junges deutsches Publikum.\n"
-                f"Originaler TikTok-Text: \"{raw_caption}\"\n\n"
-                f"Schreibe NUR die Beschreibung auf Deutsch (2-3 Sätze).\n"
-                f"Etwas informativer als Instagram, aber locker. Keine Hashtags, kein Footer."
-            )
-
-        response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",
-            contents=[video_file, prompt],
-        )
-
-        try:
-            client.files.delete(name=video_file.name)
-        except Exception:
-            pass
-
-        text = response.text.strip()
-        log.info(f"Gemini {platform}-Caption: {text[:80]!r}")
-        return text
-
-    except Exception as e:
-        # Hochgeladene Datei aufräumen falls vorhanden
-        if client is not None and video_file is not None:
-            try:
-                client.files.delete(name=video_file.name)
-            except Exception:
-                pass
-
-        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            _gemini_quota_exceeded = True
-            log.warning("Gemini Quota erschöpft → alle weiteren Gemini-Calls in diesem Run übersprungen")
-        else:
-            log.warning(f"Gemini ({platform}) fehlgeschlagen: {e} → Fallback auf Original")
-
-        caption_text, _ = _extract(raw_caption)
-        return caption_text
+    return f"{caption_text}\n\n{YOUTUBE_SOCIALS}\n\n{_build_hashtags(raw, '#Shorts')}"
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -708,7 +609,17 @@ def get_youtube_token() -> str | None:
         timeout=15,
     )
     if r.status_code != 200:
-        log.warning(f"YouTube Token-Refresh fehlgeschlagen: {r.text}")
+        log.error(f"YouTube Token-Refresh fehlgeschlagen: {r.text}")
+        if "invalid_grant" in r.text:
+            telegram(
+                "❌ <b>YouTube Refresh-Token abgelaufen!</b>\n"
+                "Ursache: OAuth-App steht auf 'Testing' → Token läuft nach 7 Tagen ab.\n"
+                "Fix: console.cloud.google.com → OAuth consent screen → App auf "
+                "'In Production' stellen, dann setup_youtube.py neu ausführen und "
+                "YOUTUBE_REFRESH_TOKEN Secret aktualisieren."
+            )
+        else:
+            telegram(f"❌ <b>YouTube Token-Fehler:</b>\n{r.text[:300]}")
         return None
     log.info("YouTube Token erfolgreich geladen")
     return r.json()["access_token"]
@@ -716,7 +627,9 @@ def get_youtube_token() -> str | None:
 
 def upload_to_youtube(video_path: str, title: str, description: str, token: str) -> str:
     file_size = Path(video_path).stat().st_size
-    yt_title = (title[:95] + " #Shorts") if title else "#Shorts"
+    # YouTube-Titel: keine < >, keine Zeilenumbrüche, max 100 Zeichen
+    clean_title = title.replace("<", "").replace(">", "").replace("\n", " ").strip()
+    yt_title = (clean_title[:90] + " #Shorts") if clean_title else "#Shorts"
 
     metadata = json.dumps({
         "snippet": {
@@ -742,7 +655,8 @@ def upload_to_youtube(video_path: str, title: str, description: str, token: str)
         data=metadata,
         timeout=30,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"YouTube Upload-Init {r.status_code}: {r.text[:500]}")
     upload_url = r.headers["Location"]
 
     log.info(f"YouTube Upload: {file_size / 1_000_000:.1f} MB")
@@ -753,8 +667,17 @@ def upload_to_youtube(video_path: str, title: str, description: str, token: str)
             data=f,
             timeout=300,
         )
-    r.raise_for_status()
-    return r.json()["id"]
+    if r.status_code >= 400:
+        raise RuntimeError(f"YouTube Upload {r.status_code}: {r.text[:500]}")
+    result = r.json()
+
+    # uploadStatus prüfen – 'rejected' heißt: hochgeladen aber nicht sichtbar
+    upload_status = (result.get("status") or {}).get("uploadStatus", "")
+    if upload_status == "rejected":
+        reason = (result.get("status") or {}).get("rejectionReason", "unbekannt")
+        raise RuntimeError(f"YouTube hat das Video abgelehnt: {reason}")
+
+    return result["id"]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -835,22 +758,9 @@ def main() -> None:
                 video_path = download_video(video_url, cookie_file, work_dir)
                 log.info(f"Download OK: {video_path}")
 
-                # Caption generieren
-                # Footer & Hashtags werden IMMER angehängt (build_instagram_caption / build_youtube_description)
-                # Gemini liefert nur den Haupttext – bei Quota-Erschöpfung oder Fehler: Fallback
-                if GEMINI_API_KEY and _gemini_quota_ok(state):
-                    ig_text = generate_caption_gemini(video_path, raw_caption, "instagram")
-                    yt_text = generate_caption_gemini(video_path, raw_caption, "youtube")
-                    state["gemini_calls"] = state.get("gemini_calls", 0) + 2
-                    caption = build_instagram_caption(ig_text, raw_caption)
-                    yt_desc = build_youtube_description(yt_text, raw_caption)
-                    title_text = ig_text.split("\n")[0][:95] or raw_caption.split("#")[0].strip() or "New Short"
-                else:
-                    if GEMINI_API_KEY:
-                        log.info("Gemini Quota erschöpft → Fallback auf Original-Caption")
-                    caption = process_caption(raw_caption)
-                    yt_desc = youtube_description(raw_caption)
-                    title_text = raw_caption.split("#")[0].strip() or "New Short"
+                caption    = process_caption(raw_caption)
+                yt_desc    = youtube_description(raw_caption)
+                title_text = raw_caption.split("#")[0].strip() or "New Short"
 
                 log.info("Lade auf GitHub Release hoch...")
                 public_url, release_id = upload_to_github_release(video_path, tag)
@@ -874,6 +784,8 @@ def main() -> None:
                     except Exception as e:
                         log.error(f"YouTube fehlgeschlagen: {e}", exc_info=True)
                         telegram(f"⚠️ YouTube fehlgeschlagen für {video_id}: {e}")
+                else:
+                    log.warning("YouTube-Upload übersprungen: kein gültiges Token (siehe Fehler oben)")
 
                 state["last_video_id"] = video_id
                 posted_ids.append(video_id)
