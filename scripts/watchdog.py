@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dead-Man-Switch: Schlägt per Telegram Alarm, wenn der Crossposter länger als
+Dead-Man-Switch: Schlägt per Discord Alarm, wenn der Crossposter länger als
 MAX_AGE_HOURS keinen Heartbeat (last_updated im Gist) geschrieben hat.
 Läuft als eigener Workflow unabhängig vom Crossposter.
 """
@@ -12,27 +12,22 @@ from datetime import datetime, timezone
 
 import requests
 
-GIST_TOKEN         = os.environ["GIST_TOKEN"]
-GIST_ID            = os.environ["GIST_ID"]
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+GIST_TOKEN          = os.environ["GIST_TOKEN"]
+GIST_ID             = os.environ["GIST_ID"]
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 GIST_FILENAME = "state.json"
 MAX_AGE_HOURS = 6
 
 
-def telegram(text: str) -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("Telegram nicht konfiguriert – Alarm kann nicht zugestellt werden!")
+def notify(text: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        print("Discord-Webhook nicht konfiguriert – Alarm kann nicht zugestellt werden!")
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
     except Exception as e:
-        print(f"Telegram-Fehler: {e}")
+        print(f"Discord-Fehler: {e}")
 
 
 def main() -> None:
@@ -42,12 +37,12 @@ def main() -> None:
         r.raise_for_status()
         state = json.loads(r.json()["files"][GIST_FILENAME]["content"])
     except Exception as e:
-        telegram(f"🚨 <b>Watchdog: State-Gist nicht lesbar!</b>\n{type(e).__name__}: {e}")
+        notify(f"🚨 **Watchdog: State-Gist nicht lesbar!**\n{type(e).__name__}: {e}")
         sys.exit(1)
 
     last_raw = state.get("last_updated")
     if not last_raw:
-        telegram("🚨 <b>Watchdog: kein Heartbeat im State gefunden.</b>")
+        notify("🚨 **Watchdog: kein Heartbeat im State gefunden.**")
         return
 
     now = datetime.now(timezone.utc)
@@ -65,8 +60,8 @@ def main() -> None:
             print("Alarm bereits gesendet – überspringe.")
             return
 
-    telegram(
-        f"🚨 <b>Crossposter läuft nicht mehr!</b>\n"
+    notify(
+        f"🚨 **Crossposter läuft nicht mehr!**\n"
         f"Letzter Heartbeat vor {age_hours:.1f} Stunden.\n"
         f"Prüfen: cron-job.org Status und GitHub Actions Runs."
     )

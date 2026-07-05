@@ -39,8 +39,7 @@ GITHUB_REPOSITORY    = os.environ["GITHUB_REPOSITORY"]
 GIST_TOKEN           = os.environ["GIST_TOKEN"]
 GIST_ID              = os.environ["GIST_ID"]
 
-TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
+DISCORD_WEBHOOK_URL  = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
@@ -110,18 +109,15 @@ def youtube_description(raw: str) -> str:
     return f"{caption_text}\n\n{YOUTUBE_SOCIALS}\n\n{_build_hashtags(raw, '#Shorts')}"
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-def telegram(text: str) -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+# ── Discord ───────────────────────────────────────────────────────────────────
+def notify(text: str) -> None:
+    """Sendet eine Nachricht an den Discord-Webhook (Markdown, max 2000 Zeichen)."""
+    if not DISCORD_WEBHOOK_URL:
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
     except Exception as e:
-        log.warning(f"Telegram: {e}")
+        log.warning(f"Discord: {e}")
 
 
 # ── State (Gist) ──────────────────────────────────────────────────────────────
@@ -617,15 +613,15 @@ def get_youtube_token() -> str | None:
     if r.status_code != 200:
         log.error(f"YouTube Token-Refresh fehlgeschlagen: {r.text}")
         if "invalid_grant" in r.text:
-            telegram(
-                "❌ <b>YouTube Refresh-Token abgelaufen!</b>\n"
+            notify(
+                "❌ **YouTube Refresh-Token abgelaufen!**\n"
                 "Ursache: OAuth-App steht auf 'Testing' → Token läuft nach 7 Tagen ab.\n"
                 "Fix: console.cloud.google.com → OAuth consent screen → App auf "
                 "'In Production' stellen, dann setup_youtube.py neu ausführen und "
                 "YOUTUBE_REFRESH_TOKEN Secret aktualisieren."
             )
         else:
-            telegram(f"❌ <b>YouTube Token-Fehler:</b>\n{r.text[:300]}")
+            notify(f"❌ **YouTube Token-Fehler:**\n{r.text[:300]}")
         return None
     log.info("YouTube Token erfolgreich geladen")
     return r.json()["access_token"]
@@ -704,7 +700,7 @@ def in_posting_window() -> bool:
 
 
 def check_cookie_expiry(cookie_file: str, state: dict) -> None:
-    """Warnt per Telegram wenn wichtige TikTok-Session-Cookies in <7 Tagen ablaufen (max. 1x/Tag)."""
+    """Warnt per Discord wenn wichtige TikTok-Session-Cookies in <7 Tagen ablaufen (max. 1x/Tag)."""
     try:
         now = time.time()
         soonest: tuple[float, str] | None = None
@@ -738,13 +734,13 @@ def check_cookie_expiry(cookie_file: str, state: dict) -> None:
         state["cookie_warned_date"] = today
 
         if days_left < 0:
-            msg = (f"❌ <b>TikTok-Cookie '{soonest[1]}' ist abgelaufen!</b>\n"
+            msg = (f"❌ **TikTok-Cookie '{soonest[1]}' ist abgelaufen!**\n"
                    f"Neue Cookies exportieren und Secret TIKTOK_COOKIES_B64 aktualisieren.")
         else:
-            msg = (f"⚠️ <b>TikTok-Cookie '{soonest[1]}' läuft in {days_left:.0f} Tag(en) ab.</b>\n"
+            msg = (f"⚠️ **TikTok-Cookie '{soonest[1]}' läuft in {days_left:.0f} Tag(en) ab.**\n"
                    f"Bald neue Cookies exportieren und Secret TIKTOK_COOKIES_B64 aktualisieren.")
         log.warning(msg)
-        telegram(msg)
+        notify(msg)
     except Exception as e:
         log.warning(f"Cookie-Check fehlgeschlagen: {e}")
 
@@ -793,7 +789,7 @@ def main() -> None:
     except Exception as e:
         msg = f"❌ Gist lesen fehlgeschlagen: {e}"
         log.error(msg)
-        telegram(msg)
+        notify(msg)
         sys.exit(1)
 
     state["instagram_access_token"] = refresh_instagram_token(state["instagram_access_token"])
@@ -809,7 +805,7 @@ def main() -> None:
         except Exception as e:
             msg = f"❌ TikTok Profil-Abruf fehlgeschlagen (Cookies abgelaufen?): {e}"
             log.error(msg)
-            telegram(msg)
+            notify(msg)
             sys.exit(1)
 
         if not videos:
@@ -822,7 +818,7 @@ def main() -> None:
             state["last_video_id"] = videos[0]["id"]
             write_state(state)
             log.info(f"Erster Run: ID {videos[0]['id']!r} gespeichert.")
-            telegram("✅ <b>Crossposter initialisiert!</b>\nAb dem nächsten TikTok-Video wird automatisch gepostet.")
+            notify("✅ **Crossposter initialisiert!**\nAb dem nächsten TikTok-Video wird automatisch gepostet.")
             return
 
         new_videos = []
@@ -905,7 +901,7 @@ def main() -> None:
                         log.info(f"✅ YouTube Short: {yt_video_id}")
                     except Exception as e:
                         log.error(f"YouTube fehlgeschlagen: {e}", exc_info=True)
-                        telegram(f"⚠️ YouTube fehlgeschlagen für {video_id}: {e}")
+                        notify(f"⚠️ YouTube fehlgeschlagen für {video_id}: {e}")
                 else:
                     log.warning("YouTube-Upload übersprungen: kein gültiges Token (siehe Fehler oben)")
 
@@ -914,10 +910,10 @@ def main() -> None:
                 state["posted_ids"] = posted_ids[-100:]  # max 100 IDs behalten
                 write_state(state)
 
-                yt_line = f"\nYouTube: <code>{yt_video_id}</code>" if yt_video_id else ""
-                telegram(
-                    f"✅ <b>Neuer Post!</b>\n"
-                    f"Instagram: <code>{ig_id}</code>{yt_line}\n"
+                yt_line = f"\nYouTube: `{yt_video_id}`" if yt_video_id else ""
+                notify(
+                    f"✅ **Neuer Post!**\n"
+                    f"Instagram: `{ig_id}`{yt_line}\n"
                     f"Caption: {raw_caption[:100]}"
                 )
 
@@ -926,13 +922,13 @@ def main() -> None:
                 video["attempts"] = video.get("attempts", 0) + 1
                 if video["attempts"] >= RETRY_MAX:
                     queue.remove(video)
-                    telegram(
-                        f"❌ <b>{video_id} endgültig fehlgeschlagen</b> "
+                    notify(
+                        f"❌ **{video_id} endgültig fehlgeschlagen** "
                         f"(nach {RETRY_MAX} Versuchen aufgegeben)\n{type(e).__name__}: {e}"
                     )
                 else:
-                    telegram(
-                        f"⚠️ <b>Fehler bei {video_id}</b> "
+                    notify(
+                        f"⚠️ **Fehler bei {video_id}** "
                         f"(Versuch {video['attempts']}/{RETRY_MAX}, wird beim nächsten Run erneut versucht)\n"
                         f"{type(e).__name__}: {e}"
                     )
