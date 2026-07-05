@@ -19,7 +19,12 @@ CLIENT_ID     = input("Google Client ID: ").strip()
 CLIENT_SECRET = input("Google Client Secret: ").strip()
 
 REDIRECT_URI = "http://localhost:8080/callback"
-SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+# upload = Videos hochladen | youtube = Titel ändern (A/B-Test) | analytics = CTR lesen
+SCOPE = (
+    "https://www.googleapis.com/auth/youtube.upload "
+    "https://www.googleapis.com/auth/youtube "
+    "https://www.googleapis.com/auth/yt-analytics.readonly"
+)
 STATE = secrets.token_urlsafe(16)
 
 code_holder: dict = {}

@@ -1,0 +1,33 @@
+name: Watchdog
+
+# Dead-Man-Switch: prüft alle 2h ob der Crossposter noch Heartbeats schreibt.
+# Läuft bewusst über GitHubs eigenen Scheduler (unabhängig von cron-job.org).
+on:
+  schedule:
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install requests
+
+      - name: Watchdog ausführen
+        env:
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
+          GIST_ID:            ${{ secrets.GIST_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/watchdog.py

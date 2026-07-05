@@ -46,6 +46,12 @@ YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 
+ARCHIVE_REPO   = os.environ.get("ARCHIVE_REPO", "")    # z.B. "User/TikTok-Archiv" (privates Repo)
+ARCHIVE_TOKEN  = os.environ.get("ARCHIVE_TOKEN", "")   # PAT mit repo-Scope für das Archiv-Repo
+POSTING_WINDOW = os.environ.get("POSTING_WINDOW", "")  # z.B. "17-21" (Europe/Berlin), leer = sofort posten
+
+RETRY_MAX = 3  # max. Versuche pro Video bevor es endgültig aufgegeben wird
+
 GIST_FILENAME = "state.json"
 IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
@@ -680,6 +686,104 @@ def upload_to_youtube(video_path: str, title: str, description: str, token: str)
     return result["id"]
 
 
+# ── Robustheit & Extras ───────────────────────────────────────────────────────
+def in_posting_window() -> bool:
+    """True wenn jetzt gepostet werden darf (POSTING_WINDOW leer = immer)."""
+    if not POSTING_WINDOW:
+        return True
+    try:
+        from zoneinfo import ZoneInfo
+        start_h, end_h = (int(x) for x in POSTING_WINDOW.split("-"))
+        hour = datetime.now(ZoneInfo("Europe/Berlin")).hour
+        if start_h <= end_h:
+            return start_h <= hour < end_h
+        return hour >= start_h or hour < end_h  # Fenster über Mitternacht, z.B. "22-2"
+    except Exception as e:
+        log.warning(f"POSTING_WINDOW ungültig ({POSTING_WINDOW!r}): {e} → poste sofort")
+        return True
+
+
+def check_cookie_expiry(cookie_file: str, state: dict) -> None:
+    """Warnt per Telegram wenn wichtige TikTok-Session-Cookies in <7 Tagen ablaufen (max. 1x/Tag)."""
+    try:
+        now = time.time()
+        soonest: tuple[float, str] | None = None
+        for line in Path(cookie_file).read_text().splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7 or "tiktok" not in parts[0]:
+                continue
+            expiry_raw, name = parts[4], parts[5]
+            if name not in ("sessionid", "sessionid_ss", "sid_tt", "sid_guard"):
+                continue
+            try:
+                expiry = float(expiry_raw)
+            except ValueError:
+                continue
+            if expiry <= 0:
+                continue
+            if soonest is None or expiry < soonest[0]:
+                soonest = (expiry, name)
+
+        if soonest is None:
+            return
+        days_left = (soonest[0] - now) / 86400
+        if days_left > 7:
+            return
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if state.get("cookie_warned_date") == today:
+            return
+        state["cookie_warned_date"] = today
+
+        if days_left < 0:
+            msg = (f"❌ <b>TikTok-Cookie '{soonest[1]}' ist abgelaufen!</b>\n"
+                   f"Neue Cookies exportieren und Secret TIKTOK_COOKIES_B64 aktualisieren.")
+        else:
+            msg = (f"⚠️ <b>TikTok-Cookie '{soonest[1]}' läuft in {days_left:.0f} Tag(en) ab.</b>\n"
+                   f"Bald neue Cookies exportieren und Secret TIKTOK_COOKIES_B64 aktualisieren.")
+        log.warning(msg)
+        telegram(msg)
+    except Exception as e:
+        log.warning(f"Cookie-Check fehlgeschlagen: {e}")
+
+
+def archive_video(video_path: str, video_id: str, caption: str) -> None:
+    """Sichert das Video dauerhaft als Release-Asset im privaten Archiv-Repo (optional)."""
+    if not (ARCHIVE_REPO and ARCHIVE_TOKEN):
+        return
+    headers = {"Authorization": f"token {ARCHIVE_TOKEN}", "Accept": "application/vnd.github+json"}
+    tag = f"tiktok-{video_id}"
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{ARCHIVE_REPO}/releases/tags/{tag}",
+            headers=headers, timeout=15,
+        )
+        if r.status_code == 200:
+            log.info(f"Archiv: {video_id} bereits gesichert")
+            return
+
+        r = requests.post(
+            f"https://api.github.com/repos/{ARCHIVE_REPO}/releases",
+            headers=headers,
+            json={"tag_name": tag, "name": (caption[:80] or tag), "body": caption},
+            timeout=15,
+        )
+        r.raise_for_status()
+        upload_base = r.json()["upload_url"].split("{")[0]
+        with open(video_path, "rb") as f:
+            r = requests.post(
+                f"{upload_base}?name={video_id}.mp4",
+                headers={**headers, "Content-Type": "video/mp4"},
+                data=f, timeout=300,
+            )
+        r.raise_for_status()
+        log.info(f"✅ Archiv: {video_id} gesichert")
+    except Exception as e:
+        log.warning(f"Archiv-Backup fehlgeschlagen (nicht kritisch): {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     log.info("=== Run gestartet ===")
@@ -698,6 +802,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as base_dir:
         cookie_file = write_cookie_file(base_dir)
+        check_cookie_expiry(cookie_file, state)
 
         try:
             videos = get_profile_videos(cookie_file)
@@ -725,30 +830,45 @@ def main() -> None:
             if v["id"] == last_id:
                 break
             new_videos.append(v)
+        new_videos.reverse()  # älteste zuerst
 
-        if not new_videos:
+        # ── Queue: neue Videos + Retries zusammenführen (crash-sicher im Gist) ──
+        queue: list[dict] = state.setdefault("retry_queue", [])
+        known_ids = {q["id"] for q in queue}
+        for v in new_videos:
+            if v["id"] not in known_ids:
+                queue.append({"id": v["id"], "url": v["url"],
+                              "description": v["description"], "attempts": 0})
+        if new_videos:
+            state["last_video_id"] = new_videos[-1]["id"]
+        write_state(state)  # Heartbeat + Queue sofort persistieren
+
+        if not queue:
             log.info(f"Keine neuen Videos seit {last_id}.")
-            write_state(state)
             return
 
-        log.info(f"{len(new_videos)} neues Video(s) gefunden")
-        new_videos.reverse()
+        if not in_posting_window():
+            log.info(f"{len(queue)} Video(s) warten auf das Posting-Fenster ({POSTING_WINDOW} Uhr).")
+            return
 
+        log.info(f"{len(queue)} Video(s) in der Queue")
         posted_ids: list[str] = state.setdefault("posted_ids", [])
 
-        for video in new_videos:
+        for video in list(queue):
             video_id    = video["id"]
             raw_caption = video["description"]
             video_url   = video["url"]
-            log.info(f"Verarbeite {video_id}: {raw_caption[:60]!r}")
+            log.info(f"Verarbeite {video_id} (Versuch {video.get('attempts', 0) + 1}/{RETRY_MAX}): {raw_caption[:60]!r}")
 
             if video_id in posted_ids:
                 log.info(f"Duplikat übersprungen: {video_id}")
+                queue.remove(video)
+                write_state(state)
                 continue
 
             # Eigenes Verzeichnis pro Video → keine Konflikte
             work_dir = str(Path(base_dir) / video_id)
-            Path(work_dir).mkdir()
+            Path(work_dir).mkdir(exist_ok=True)
 
             release_id: int | None = None
             tag = f"tmp-vid-{video_id}-{int(time.time())}"
@@ -757,6 +877,8 @@ def main() -> None:
                 log.info("Lade Video herunter...")
                 video_path = download_video(video_url, cookie_file, work_dir)
                 log.info(f"Download OK: {video_path}")
+
+                archive_video(video_path, video_id, raw_caption)
 
                 caption    = process_caption(raw_caption)
                 yt_desc    = youtube_description(raw_caption)
@@ -787,7 +909,7 @@ def main() -> None:
                 else:
                     log.warning("YouTube-Upload übersprungen: kein gültiges Token (siehe Fehler oben)")
 
-                state["last_video_id"] = video_id
+                queue.remove(video)
                 posted_ids.append(video_id)
                 state["posted_ids"] = posted_ids[-100:]  # max 100 IDs behalten
                 write_state(state)
@@ -801,7 +923,20 @@ def main() -> None:
 
             except Exception as e:
                 log.error(f"Fehler bei {video_id}: {e}", exc_info=True)
-                telegram(f"❌ <b>Fehler bei {video_id}</b>\n{type(e).__name__}: {e}")
+                video["attempts"] = video.get("attempts", 0) + 1
+                if video["attempts"] >= RETRY_MAX:
+                    queue.remove(video)
+                    telegram(
+                        f"❌ <b>{video_id} endgültig fehlgeschlagen</b> "
+                        f"(nach {RETRY_MAX} Versuchen aufgegeben)\n{type(e).__name__}: {e}"
+                    )
+                else:
+                    telegram(
+                        f"⚠️ <b>Fehler bei {video_id}</b> "
+                        f"(Versuch {video['attempts']}/{RETRY_MAX}, wird beim nächsten Run erneut versucht)\n"
+                        f"{type(e).__name__}: {e}"
+                    )
+                write_state(state)
             finally:
                 if release_id is not None:
                     delete_github_release(release_id, tag)
