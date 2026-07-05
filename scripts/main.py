@@ -51,6 +51,15 @@ POSTING_WINDOW = os.environ.get("POSTING_WINDOW", "")  # z.B. "17-21" (Europe/Be
 
 RETRY_MAX = 3  # max. Versuche pro Video bevor es endgültig aufgegeben wird
 
+# Performance-Monitoring: 7 Tage beobachten, ab 2000 Views → KPI-Log
+PERF_THRESHOLD_VIEWS = 2000
+PERF_WATCH_DAYS      = 7
+PERF_CHECK_HOURS     = 4    # Mindestabstand zwischen zwei Checks desselben Posts
+
+# YouTube A/B-Test: 24h Titel A, 24h Titel B, dann gewinnt der bessere
+AB_PHASE_HOURS = 24
+AB_HOOKS       = ["🔥", "😳", "💀", "⚡"]
+
 GIST_FILENAME = "state.json"
 IG_GRAPH      = "https://graph.instagram.com/v21.0"
 
@@ -627,7 +636,7 @@ def get_youtube_token() -> str | None:
     return r.json()["access_token"]
 
 
-def upload_to_youtube(video_path: str, title: str, description: str, token: str) -> str:
+def upload_to_youtube(video_path: str, title: str, description: str, token: str) -> tuple[str, str]:
     file_size = Path(video_path).stat().st_size
     # YouTube-Titel: keine < >, keine Zeilenumbrüche, max 100 Zeichen
     clean_title = title.replace("<", "").replace(">", "").replace("\n", " ").strip()
@@ -679,7 +688,7 @@ def upload_to_youtube(video_path: str, title: str, description: str, token: str)
         reason = (result.get("status") or {}).get("rejectionReason", "unbekannt")
         raise RuntimeError(f"YouTube hat das Video abgelehnt: {reason}")
 
-    return result["id"]
+    return result["id"], yt_title
 
 
 # ── Robustheit & Extras ───────────────────────────────────────────────────────
@@ -780,6 +789,250 @@ def archive_video(video_path: str, video_id: str, caption: str) -> None:
         log.warning(f"Archiv-Backup fehlgeschlagen (nicht kritisch): {e}")
 
 
+# ── Performance-Monitoring (pro Plattform unabhängig) ────────────────────────
+def _fmt_int(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def _kpi_line(stats: dict) -> str:
+    mapping = [("views", "👀 Views"), ("reach", "📣 Reach"), ("likes", "❤️ Likes"),
+               ("comments", "💬 Kommentare"), ("shares", "🔁 Shares"), ("saved", "🔖 Saves")]
+    return " | ".join(f"{label}: {_fmt_int(stats[key])}" for key, label in mapping if key in stats)
+
+
+def _ig_media_stats(media_id: str, token: str) -> dict | None:
+    r = None
+    for metrics in ("views,reach,likes,comments,shares,saved",
+                    "plays,reach,likes,comments,shares,saved"):
+        r = requests.get(
+            f"{IG_GRAPH}/{media_id}/insights",
+            params={"metric": metrics, "access_token": token},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            out = {}
+            for item in r.json().get("data", []):
+                values = item.get("values") or [{}]
+                out[item["name"]] = values[0].get("value", 0) or 0
+            if "plays" in out and "views" not in out:
+                out["views"] = out.pop("plays")
+            return out
+    log.warning(f"IG Insights fehlgeschlagen für {media_id}: {r.text[:200] if r is not None else '?'}")
+    return None
+
+
+def _yt_video_stats(video_id: str, token: str) -> dict | None:
+    r = requests.get(
+        "https://www.googleapis.com/youtube/v3/videos",
+        params={"part": "statistics", "id": video_id},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        log.warning(f"YT Stats fehlgeschlagen für {video_id}: {r.text[:200]}")
+        return None
+    items = r.json().get("items", [])
+    if not items:
+        return None
+    s = items[0].get("statistics", {})
+    return {"views": int(s.get("viewCount", 0)), "likes": int(s.get("likeCount", 0)),
+            "comments": int(s.get("commentCount", 0))}
+
+
+def _tiktok_video_stats(url: str, cookie_file: str) -> dict | None:
+    try:
+        with yt_dlp.YoutubeDL({"cookiefile": cookie_file, "quiet": True,
+                               "no_warnings": True, "socket_timeout": 30}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return {"views": info.get("view_count") or 0, "likes": info.get("like_count") or 0,
+                "comments": info.get("comment_count") or 0, "shares": info.get("repost_count") or 0}
+    except Exception as e:
+        log.warning(f"TikTok Stats fehlgeschlagen: {e}")
+        return None
+
+
+def _append_gist_performance(entry_md: str) -> None:
+    """Hängt einen Eintrag an die Datei performance.md im State-Gist an."""
+    try:
+        headers = {"Authorization": f"token {GIST_TOKEN}"}
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers, timeout=15)
+        r.raise_for_status()
+        files = r.json().get("files", {})
+        old = (files.get("performance.md") or {}).get("content") or "# 📊 Performance-Log\n"
+        requests.patch(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers=headers,
+            json={"files": {"performance.md": {"content": old + entry_md}}},
+            timeout=15,
+        ).raise_for_status()
+    except Exception as e:
+        log.warning(f"Performance-Log (Gist) fehlgeschlagen: {e}")
+
+
+def _write_performance_log(item: dict, stats: dict, age_days: float) -> None:
+    emoji = {"instagram": "📸", "youtube": "▶️", "tiktok": "📱"}.get(item["platform"], "📊")
+    kpis = _kpi_line(stats)
+    notify(
+        f"{emoji} **Performance-Log: {item['platform'].capitalize()}**\n"
+        f"_{item['caption']}_\n"
+        f"🎉 {_fmt_int(PERF_THRESHOLD_VIEWS)}+ Views nach {age_days:.1f} Tagen!\n{kpis}"
+    )
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _append_gist_performance(
+        f"\n---\n**{item['platform']}** · {date}\n"
+        f"- Caption: {item['caption']}\n"
+        f"- ID: `{item['id']}`\n"
+        f"- Schwelle erreicht nach {age_days:.1f} Tagen\n"
+        f"- {kpis}\n"
+    )
+
+
+def monitor_performance(state: dict, cookie_file: str, yt_token: str | None) -> None:
+    """Beobachtet jeden Post 7 Tage; ab 2000 Views → Performance-Log (je Plattform unabhängig)."""
+    watch = state.get("perf_watch", [])
+    if not watch:
+        return
+    now = datetime.now(timezone.utc)
+    changed = False
+    remaining: list[dict] = []
+
+    for item in watch:
+        age_days = (now - datetime.fromisoformat(item["posted_at"])).total_seconds() / 86400
+        if age_days > PERF_WATCH_DAYS:
+            log.info(f"Perf-Watch beendet ({item['platform']} {item['id']}): 7 Tage um, unter Schwelle")
+            changed = True
+            continue
+
+        last = item.get("last_checked")
+        if last and (now - datetime.fromisoformat(last)).total_seconds() < PERF_CHECK_HOURS * 3600:
+            remaining.append(item)
+            continue
+        item["last_checked"] = now.isoformat()
+        changed = True
+
+        platform = item["platform"]
+        if platform == "instagram":
+            stats = _ig_media_stats(item["id"], state["instagram_access_token"])
+        elif platform == "youtube":
+            stats = _yt_video_stats(item["id"], yt_token) if yt_token else None
+        else:
+            stats = _tiktok_video_stats(item.get("url", ""), cookie_file)
+
+        if not stats:
+            remaining.append(item)
+            continue
+
+        if stats.get("views", 0) >= PERF_THRESHOLD_VIEWS:
+            log.info(f"🎉 Perf-Schwelle erreicht: {platform} {item['id']} ({stats.get('views')} Views)")
+            _write_performance_log(item, stats, age_days)
+        else:
+            remaining.append(item)
+
+    state["perf_watch"] = remaining
+    if changed:
+        write_state(state)
+
+
+# ── YouTube A/B-Test ──────────────────────────────────────────────────────────
+def _yt_update_title(video_id: str, new_title: str, token: str) -> bool:
+    """Ändert den Titel eines Videos (snippet wird komplett übernommen, sonst löscht die API Felder)."""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        r = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "snippet", "id": video_id},
+            headers=headers, timeout=15,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return False
+        snippet = items[0]["snippet"]
+        snippet["title"] = new_title
+
+        r = requests.put(
+            "https://www.googleapis.com/youtube/v3/videos?part=snippet",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"id": video_id, "snippet": snippet},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            log.warning(f"YT Titel-Update fehlgeschlagen ({r.status_code}): {r.text[:300]}")
+            if r.status_code == 403:
+                notify(
+                    "⚠️ **A/B-Test: keine Berechtigung zum Titel-Ändern.**\n"
+                    "Einmal `setup_youtube.py` neu ausführen (erweiterte Scopes) und "
+                    "YOUTUBE_REFRESH_TOKEN aktualisieren."
+                )
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"YT Titel-Update Fehler: {e}")
+        return False
+
+
+def process_youtube_ab(state: dict, yt_token: str | None) -> None:
+    """24h Titel A → Views messen → 24h Titel B → Gewinner behalten."""
+    ab_list = state.get("yt_ab", [])
+    if not (ab_list and yt_token):
+        return
+    now = datetime.now(timezone.utc)
+    changed = False
+    remaining: list[dict] = []
+
+    for ab in ab_list:
+        phase = ab.get("phase", "a")
+        age_h = (now - datetime.fromisoformat(ab["posted_at"])).total_seconds() / 3600
+
+        if phase == "a" and age_h >= AB_PHASE_HOURS:
+            stats = _yt_video_stats(ab["video_id"], yt_token)
+            if stats is None:
+                remaining.append(ab)
+                continue
+            ab["views_a"] = stats["views"]
+            if _yt_update_title(ab["video_id"], ab["title_b"], yt_token):
+                ab["phase"] = "b"
+                ab["switched_at"] = now.isoformat()
+                notify(
+                    f"🧪 **A/B-Test gestartet** für `{ab['video_id']}`\n"
+                    f"A ({_fmt_int(stats['views'])} Views in 24h): {ab['title_a']}\n"
+                    f"B (jetzt aktiv): {ab['title_b']}"
+                )
+                changed = True
+                remaining.append(ab)
+            else:
+                # Titel-Wechsel nicht möglich → Test abbrechen, nicht ewig weiterversuchen
+                changed = True
+
+        elif phase == "b" and ab.get("switched_at") and \
+                (now - datetime.fromisoformat(ab["switched_at"])).total_seconds() / 3600 >= AB_PHASE_HOURS:
+            stats = _yt_video_stats(ab["video_id"], yt_token)
+            if stats is None:
+                remaining.append(ab)
+                continue
+            views_a = ab.get("views_a", 0)
+            views_b = max(0, stats["views"] - views_a)
+            if views_a >= views_b:
+                winner, winner_title = "A", ab["title_a"]
+                _yt_update_title(ab["video_id"], ab["title_a"], yt_token)
+            else:
+                winner, winner_title = "B", ab["title_b"]
+            notify(
+                f"🏁 **A/B-Test beendet** `{ab['video_id']}`\n"
+                f"A: {_fmt_int(views_a)} Views (0–24h) – {ab['title_a']}\n"
+                f"B: {_fmt_int(views_b)} Views (24–48h) – {ab['title_b']}\n"
+                f"🏆 Gewinner: **{winner}** → Titel: {winner_title}"
+            )
+            changed = True
+
+        else:
+            remaining.append(ab)
+
+    state["yt_ab"] = remaining
+    if changed:
+        write_state(state)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     log.info("=== Run gestartet ===")
@@ -799,6 +1052,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as base_dir:
         cookie_file = write_cookie_file(base_dir)
         check_cookie_expiry(cookie_file, state)
+
+        # Performance-Monitoring & laufende A/B-Tests (unabhängig von neuen Videos)
+        monitor_performance(state, cookie_file, yt_token)
+        process_youtube_ab(state, yt_token)
 
         try:
             videos = get_profile_videos(cookie_file)
@@ -895,15 +1152,37 @@ def main() -> None:
 
                 # YouTube – video_path noch vorhanden (work_dir existiert noch)
                 yt_video_id = None
+                yt_title_used = None
                 if yt_token:
                     try:
-                        yt_video_id = upload_to_youtube(video_path, title_text, yt_desc, yt_token)
+                        yt_video_id, yt_title_used = upload_to_youtube(video_path, title_text, yt_desc, yt_token)
                         log.info(f"✅ YouTube Short: {yt_video_id}")
                     except Exception as e:
                         log.error(f"YouTube fehlgeschlagen: {e}", exc_info=True)
                         notify(f"⚠️ YouTube fehlgeschlagen für {video_id}: {e}")
                 else:
                     log.warning("YouTube-Upload übersprungen: kein gültiges Token (siehe Fehler oben)")
+
+                # Performance-Watch (je Plattform unabhängig) + A/B-Test registrieren
+                now_iso   = datetime.now(timezone.utc).isoformat()
+                cap_short = raw_caption[:80] or video_id
+                perf = state.setdefault("perf_watch", [])
+                perf.append({"platform": "tiktok", "id": video_id, "url": video_url,
+                             "caption": cap_short, "posted_at": now_iso})
+                perf.append({"platform": "instagram", "id": ig_id,
+                             "caption": cap_short, "posted_at": now_iso})
+                if yt_video_id:
+                    perf.append({"platform": "youtube", "id": yt_video_id,
+                                 "caption": cap_short, "posted_at": now_iso})
+                    base = yt_title_used[:-8] if yt_title_used.endswith(" #Shorts") else yt_title_used
+                    hook = AB_HOOKS[abs(hash(yt_video_id)) % len(AB_HOOKS)]
+                    state.setdefault("yt_ab", []).append({
+                        "video_id": yt_video_id,
+                        "title_a": yt_title_used,
+                        "title_b": f"{hook} {base}"[:91].rstrip() + " #Shorts",
+                        "posted_at": now_iso,
+                        "phase": "a",
+                    })
 
                 queue.remove(video)
                 posted_ids.append(video_id)
