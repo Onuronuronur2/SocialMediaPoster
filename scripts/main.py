@@ -464,10 +464,12 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     output_mp4 = str(Path(work_dir) / "output.mp4")
 
     # ── Einzelnes Foto ────────────────────────────────────────────────────────
-    thumb_files = [
-        f for f in Path(work_dir).iterdir()
-        if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
-    ]
+    # slide_* (Full-Res von der TikTok-Seite) bevorzugen, yt-dlp-Thumbnail nur als Fallback
+    thumb_files = sorted(
+        (f for f in Path(work_dir).iterdir()
+         if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")),
+        key=lambda f: (0 if f.name.startswith("slide_") else 1, f.name),
+    )
 
     # Sound-Länge bestimmt die Video-Länge (min. 3s wegen Instagram-Minimum)
     duration = max(3.0, _audio_duration(audio))
@@ -548,7 +550,8 @@ def delete_github_release(release_id: int, tag: str) -> None:
 
 
 # ── Instagram ─────────────────────────────────────────────────────────────────
-def refresh_instagram_token(token: str) -> str:
+def refresh_instagram_token(state: dict) -> str:
+    token = state["instagram_access_token"]
     r = requests.get(
         f"{IG_GRAPH}/refresh_access_token",
         params={"grant_type": "ig_refresh_token", "access_token": token},
@@ -556,6 +559,15 @@ def refresh_instagram_token(token: str) -> str:
     )
     if r.status_code != 200:
         log.warning(f"Instagram Token-Refresh fehlgeschlagen: {r.text}")
+        # Warnung max. 1x/Tag – wenn das dauerhaft fehlschlägt, stirbt der Token nach 60 Tagen
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if state.get("ig_refresh_warned_date") != today:
+            state["ig_refresh_warned_date"] = today
+            notify(
+                f"⚠️ **Instagram Token-Refresh fehlgeschlagen.**\n"
+                f"Wenn das täglich kommt: neuen Long-Lived-Token erstellen und im Gist "
+                f"(`instagram_access_token`) ersetzen.\n{r.text[:300]}"
+            )
         return token
     return r.json()["access_token"]
 
@@ -984,6 +996,12 @@ def process_youtube_ab(state: dict, yt_token: str | None) -> None:
         phase = ab.get("phase", "a")
         age_h = (now - datetime.fromisoformat(ab["posted_at"])).total_seconds() / 3600
 
+        # Sicherheitsnetz: hängende Tests nach 7 Tagen aufräumen
+        if age_h > 7 * 24:
+            log.info(f"A/B-Test {ab['video_id']} verwaist (>7 Tage) → entfernt")
+            changed = True
+            continue
+
         if phase == "a" and age_h >= AB_PHASE_HOURS:
             stats = _yt_video_stats(ab["video_id"], yt_token)
             if stats is None:
@@ -1001,8 +1019,13 @@ def process_youtube_ab(state: dict, yt_token: str | None) -> None:
                 changed = True
                 remaining.append(ab)
             else:
-                # Titel-Wechsel nicht möglich → Test abbrechen, nicht ewig weiterversuchen
+                # Titel-Wechsel fehlgeschlagen → bis zu 3x im nächsten Run erneut versuchen
+                ab["update_fails"] = ab.get("update_fails", 0) + 1
                 changed = True
+                if ab["update_fails"] < 3:
+                    remaining.append(ab)
+                else:
+                    log.warning(f"A/B-Test {ab['video_id']} abgebrochen (Titel-Update 3x fehlgeschlagen)")
 
         elif phase == "b" and ab.get("switched_at") and \
                 (now - datetime.fromisoformat(ab["switched_at"])).total_seconds() / 3600 >= AB_PHASE_HOURS:
@@ -1045,7 +1068,7 @@ def main() -> None:
         notify(msg)
         sys.exit(1)
 
-    state["instagram_access_token"] = refresh_instagram_token(state["instagram_access_token"])
+    state["instagram_access_token"] = refresh_instagram_token(state)
     yt_token = get_youtube_token()
     last_id: str | None = state.get("last_video_id")
 

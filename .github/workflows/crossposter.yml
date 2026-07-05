@@ -9,10 +9,15 @@ on:
 permissions:
   contents: write
 
+# Nie zwei Runs parallel – sonst lesen beide denselben State und posten doppelt
+concurrency:
+  group: crossposter
+  cancel-in-progress: false
+
 jobs:
   crossposter:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
