@@ -8,6 +8,7 @@ Läuft als eigener Workflow unabhängig vom Crossposter.
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -32,12 +33,22 @@ def notify(text: str) -> None:
 
 def main() -> None:
     headers = {"Authorization": f"token {GIST_TOKEN}"}
-    try:
-        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers, timeout=15)
-        r.raise_for_status()
-        state = json.loads(r.json()["files"][GIST_FILENAME]["content"])
-    except Exception as e:
-        notify(f"🚨 **Watchdog: State-Gist nicht lesbar!**\n{type(e).__name__}: {e}")
+    # 3 Versuche mit Backoff – ein transienter GitHub-Schluckauf soll keinen Fehl-Alarm auslösen
+    state = None
+    last_err: Exception | None = None
+    for i in range(3):
+        try:
+            r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers, timeout=30)
+            r.raise_for_status()
+            state = json.loads(r.json()["files"][GIST_FILENAME]["content"])
+            break
+        except Exception as e:
+            last_err = e
+            if i < 2:
+                print(f"Gist-Read fehlgeschlagen ({e}) → Retry in {5 * (i + 1)}s")
+                time.sleep(5 * (i + 1))
+    if state is None:
+        notify(f"🚨 **Watchdog: State-Gist nicht lesbar!**\n{type(last_err).__name__}: {last_err}")
         sys.exit(1)
 
     last_raw = state.get("last_updated")

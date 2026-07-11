@@ -118,6 +118,27 @@ def youtube_description(raw: str) -> str:
     return f"{caption_text}\n\n{YOUTUBE_SOCIALS}\n\n{_build_hashtags(raw, '#Shorts')}"
 
 
+# ── HTTP mit Retry ────────────────────────────────────────────────────────────
+def _retry_request(method: str, url: str, *, attempts: int = 3, **kwargs) -> requests.Response:
+    """HTTP-Request mit Retry bei transienten Fehlern (Timeout, Connection-Reset, 5xx).
+    4xx-Antworten werden direkt zurückgegeben – das ist Sache des Aufrufers."""
+    kwargs.setdefault("timeout", 30)
+    last_err = ""
+    for i in range(attempts):
+        try:
+            r = requests.request(method, url, **kwargs)
+            if r.status_code < 500:
+                return r
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_err = f"{type(e).__name__}: {e}"
+        if i < attempts - 1:
+            wait = 5 * (i + 1)
+            log.warning(f"{method} {url.split('?')[0]} fehlgeschlagen ({last_err}) → Retry in {wait}s")
+            time.sleep(wait)
+    raise RuntimeError(f"{method} {url.split('?')[0]} nach {attempts} Versuchen fehlgeschlagen: {last_err}")
+
+
 # ── Discord ───────────────────────────────────────────────────────────────────
 def notify(text: str) -> None:
     """Sendet eine Nachricht an den Discord-Webhook (Markdown, max 2000 Zeichen)."""
@@ -131,10 +152,10 @@ def notify(text: str) -> None:
 
 # ── State (Gist) ──────────────────────────────────────────────────────────────
 def read_state() -> dict:
-    r = requests.get(
+    r = _retry_request(
+        "GET",
         f"https://api.github.com/gists/{GIST_ID}",
         headers={"Authorization": f"token {GIST_TOKEN}"},
-        timeout=10,
     )
     r.raise_for_status()
     return json.loads(r.json()["files"][GIST_FILENAME]["content"])
@@ -142,11 +163,11 @@ def read_state() -> dict:
 
 def write_state(state: dict) -> None:
     state["last_updated"] = datetime.now(timezone.utc).isoformat()
-    requests.patch(
+    _retry_request(
+        "PATCH",
         f"https://api.github.com/gists/{GIST_ID}",
         headers={"Authorization": f"token {GIST_TOKEN}"},
         json={"files": {GIST_FILENAME: {"content": json.dumps(state, indent=2)}}},
-        timeout=10,
     ).raise_for_status()
 
 
@@ -552,11 +573,16 @@ def delete_github_release(release_id: int, tag: str) -> None:
 # ── Instagram ─────────────────────────────────────────────────────────────────
 def refresh_instagram_token(state: dict) -> str:
     token = state["instagram_access_token"]
-    r = requests.get(
-        f"{IG_GRAPH}/refresh_access_token",
-        params={"grant_type": "ig_refresh_token", "access_token": token},
-        timeout=15,
-    )
+    try:
+        r = _retry_request(
+            "GET",
+            f"{IG_GRAPH}/refresh_access_token",
+            params={"grant_type": "ig_refresh_token", "access_token": token},
+        )
+    except Exception as e:
+        # Netzwerkproblem → alten Token behalten, Run nicht abbrechen
+        log.warning(f"Instagram Token-Refresh nicht erreichbar: {e}")
+        return token
     if r.status_code != 200:
         log.warning(f"Instagram Token-Refresh fehlgeschlagen: {r.text}")
         # Warnung max. 1x/Tag – wenn das dauerhaft fehlschlägt, stirbt der Token nach 60 Tagen
@@ -621,16 +647,21 @@ def get_youtube_token() -> str | None:
     if not (YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REFRESH_TOKEN):
         log.info("YouTube: Secrets nicht konfiguriert → übersprungen")
         return None
-    r = requests.post(
-        "https://oauth2.googleapis.com/token",
-        data={
-            "client_id": YOUTUBE_CLIENT_ID,
-            "client_secret": YOUTUBE_CLIENT_SECRET,
-            "refresh_token": YOUTUBE_REFRESH_TOKEN,
-            "grant_type": "refresh_token",
-        },
-        timeout=15,
-    )
+    try:
+        r = _retry_request(
+            "POST",
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": YOUTUBE_CLIENT_ID,
+                "client_secret": YOUTUBE_CLIENT_SECRET,
+                "refresh_token": YOUTUBE_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+        )
+    except Exception as e:
+        # Netzwerkproblem → YouTube diesen Run überspringen statt alles abzubrechen
+        log.warning(f"YouTube Token-Endpoint nicht erreichbar: {e}")
+        return None
     if r.status_code != 200:
         log.error(f"YouTube Token-Refresh fehlgeschlagen: {r.text}")
         if "invalid_grant" in r.text:
@@ -867,15 +898,15 @@ def _append_gist_performance(entry_md: str) -> None:
     """Hängt einen Eintrag an die Datei performance.md im State-Gist an."""
     try:
         headers = {"Authorization": f"token {GIST_TOKEN}"}
-        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers, timeout=15)
+        r = _retry_request("GET", f"https://api.github.com/gists/{GIST_ID}", headers=headers)
         r.raise_for_status()
         files = r.json().get("files", {})
         old = (files.get("performance.md") or {}).get("content") or "# 📊 Performance-Log\n"
-        requests.patch(
+        _retry_request(
+            "PATCH",
             f"https://api.github.com/gists/{GIST_ID}",
             headers=headers,
             json={"files": {"performance.md": {"content": old + entry_md}}},
-            timeout=15,
         ).raise_for_status()
     except Exception as e:
         log.warning(f"Performance-Log (Gist) fehlgeschlagen: {e}")
