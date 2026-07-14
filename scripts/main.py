@@ -2,6 +2,7 @@
 """TikTok → Instagram Reels + YouTube Shorts auto-crossposter."""
 
 import os
+import re
 import sys
 import json
 import time
@@ -50,6 +51,8 @@ ARCHIVE_TOKEN  = os.environ.get("ARCHIVE_TOKEN", "")   # PAT mit repo-Scope für
 POSTING_WINDOW = os.environ.get("POSTING_WINDOW", "")  # z.B. "17-21" (Europe/Berlin), leer = sofort posten
 
 RETRY_MAX = 3  # max. Versuche pro Video bevor es endgültig aufgegeben wird
+
+PRIVATE_RECHECK_DAYS = 3  # private Videos so lange erneut prüfen (falls sie öffentlich werden)
 
 # Performance-Monitoring: 7 Tage beobachten, ab 2000 Views → KPI-Log
 PERF_THRESHOLD_VIEWS = 2000
@@ -257,65 +260,133 @@ def _extract_json_object(text: str, start: int) -> dict | None:
     return None
 
 
-def _slides_from_webpage(video_url: str, cookie_file: str, work_dir: str) -> list[str]:
+_TIKTOK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+}
+
+
+def _load_cookie_jar(cookie_file: str):
+    jar = http.cookiejar.MozillaCookieJar(cookie_file)
+    jar.load(ignore_discard=True, ignore_expires=True)
+    return jar
+
+
+def _fetch_tiktok_html(video_url: str, cookie_file: str) -> str:
     """
-    Primäre Slideshow-Erkennung: lädt die TikTok-Seite und parst das
-    eingebettete 'imagePost'-JSON mit allen Slide-Bild-URLs.
+    Holt das TikTok-Seiten-HTML. Probiert auch die /photo/-Variante der URL –
+    Slideshows liefern dort zuverlässiger ihre imagePost-Daten.
+    Leerstring wenn nichts brauchbares kommt.
     """
+    candidates = [video_url]
+    if "/video/" in video_url:
+        candidates.append(video_url.replace("/video/", "/photo/"))
+
     try:
-        jar = http.cookiejar.MozillaCookieJar(cookie_file)
-        jar.load(ignore_discard=True, ignore_expires=True)
+        jar = _load_cookie_jar(cookie_file)
+    except Exception as e:
+        log.warning(f"Cookie-Jar nicht ladbar: {e}")
+        jar = None
 
-        r = requests.get(
-            video_url,
-            cookies=jar,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-            },
-            timeout=30,
-            allow_redirects=True,
-        )
-        r.raise_for_status()
-        html = r.text
+    best = ""
+    for url in candidates:
+        try:
+            r = _retry_request("GET", url, cookies=jar, headers=_TIKTOK_HEADERS,
+                               attempts=2, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            html = r.text
+            # Enthält Slideshow-Daten → sofort nehmen
+            if '"imagePost"' in html or '"image_post_info"' in html:
+                return html
+            if len(html) > len(best):
+                best = html
+        except Exception as e:
+            log.warning(f"TikTok-HTML von {url} fehlgeschlagen: {e}")
+    return best
 
-        idx = html.find('"imagePost"')
-        if idx == -1:
-            log.info("Webpage-Check: kein 'imagePost' im HTML → kein Slideshow")
-            return []
 
+def tiktok_privacy(html: str, info: dict) -> str:
+    """Ermittelt die Sichtbarkeit: 'private' | 'public' | 'unknown'.
+    Primär aus dem Seiten-HTML (privateItem-Flag), Fallback yt-dlp availability."""
+    if html:
+        if '"privateItem":true' in html:
+            return "private"
+        if '"privateItem":false' in html:
+            return "public"
+    availability = (info or {}).get("availability")
+    if availability in ("private", "needs_auth", "subscriber_only"):
+        return "private"
+    if availability == "public":
+        return "public"
+    return "unknown"
+
+
+def _slides_from_html(html: str, work_dir: str) -> list[str]:
+    """
+    Parst Slide-Bild-URLs aus dem TikTok-HTML (nur für Foto-Posts).
+    3 Parser: imagePost (camelCase), image_post_info (snake_case), Regex-Fallback.
+    """
+    if not html:
+        return []
+    is_photo_post = '"imagePost"' in html or '"image_post_info"' in html
+    if not is_photo_post:
+        log.info("HTML-Check: kein imagePost → kein Foto-Post/Slideshow")
+        return []
+
+    urls: list[str] = []
+
+    # Parser 1: webapp-Format {"imagePost":{"images":[{"imageURL":{"urlList":[...]}}]}}
+    idx = html.find('"imagePost"')
+    if idx != -1:
         brace = html.find("{", idx + len('"imagePost"'))
-        image_post = _extract_json_object(html, brace) if brace != -1 else None
-        if not image_post or not image_post.get("images"):
-            log.warning("Webpage-Check: 'imagePost' gefunden, aber Parsing fehlgeschlagen")
-            return []
-
-        urls = []
-        for img in image_post["images"]:
+        obj = _extract_json_object(html, brace) if brace != -1 else None
+        for img in (obj or {}).get("images", []):
             url_list = (img.get("imageURL") or {}).get("urlList") or []
             if url_list:
                 urls.append(url_list[0])
 
-        log.info(f"Webpage-Check: imagePost mit {len(urls)} Bildern gefunden")
-        return _download_urls_as_slides(urls, work_dir)
+    # Parser 2: API-Format {"image_post_info":{"images":[{"display_image":{"url_list":[...]}}]}}
+    if not urls:
+        idx = html.find('"image_post_info"')
+        if idx != -1:
+            brace = html.find("{", idx + len('"image_post_info"'))
+            obj = _extract_json_object(html, brace) if brace != -1 else None
+            for img in (obj or {}).get("images", []):
+                url_list = (img.get("display_image") or {}).get("url_list") or []
+                if url_list:
+                    urls.append(url_list[0])
 
-    except Exception as e:
-        log.warning(f"Webpage-Check fehlgeschlagen: {e}")
-        return []
+    # Parser 3: Regex-Fallback, nur im imagePost-Segment (sonst falsche Treffer von Covern)
+    if not urls:
+        seg_start = max(html.find('"imagePost"'), html.find('"image_post_info"'))
+        segment = html[seg_start:seg_start + 100_000]
+        for match in re.finditer(r'"(?:urlList|url_list)":\s*\[\s*"((?:[^"\\]|\\.)+)"', segment):
+            try:
+                urls.append(json.loads(f'"{match.group(1)}"'))
+            except Exception:
+                pass
+
+    urls = list(dict.fromkeys(urls))  # Duplikate raus, Reihenfolge behalten
+    log.info(f"HTML-Check: Foto-Post mit {len(urls)} Bild-URL(s)")
+    return _download_urls_as_slides(urls, work_dir)
 
 
-def _detect_slideshow(info: dict, video_url: str, cookie_file: str, work_dir: str) -> list[str]:
+def _detect_slideshow(info: dict, video_url: str, cookie_file: str,
+                      work_dir: str, html: str = "") -> list[str]:
     """
     Erkennt TikTok-Slideshow und lädt alle Bilder herunter.
-    Primär: imagePost-JSON aus der TikTok-Webseite.
-    Fallback: yt-dlp Info-Dict (entries / Bild-Formate / Thumbnails).
+    Primär: imagePost-JSON aus der TikTok-Webseite (html wird mitgegeben oder geholt).
+    Fallback: yt-dlp Info-Dict (entries / Bild-Formate).
     Gibt sortierte Bildpfade zurück, oder [] wenn kein Slideshow.
     """
     # Methode 0 (primär): TikTok-Webseite parsen
-    paths = _slides_from_webpage(video_url, cookie_file, work_dir)
+    if not html:
+        html = _fetch_tiktok_html(video_url, cookie_file)
+    paths = _slides_from_html(html, work_dir)
     if len(paths) > 1:
         log.info(f"Slideshow (webpage): {len(paths)} Bilder")
         return paths
@@ -422,7 +493,17 @@ def _build_slideshow_video(slide_paths: list[str], audio_path: str, work_dir: st
     return output_mp4
 
 
-def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
+def _video_info(video_url: str, cookie_file: str) -> dict:
+    """Voll-Metadaten eines einzelnen Videos (Caption, Formate, Thumbnails)."""
+    with yt_dlp.YoutubeDL({
+        "cookiefile": cookie_file, "quiet": True,
+        "no_warnings": True, "socket_timeout": 30,
+    }) as ydl:
+        return ydl.extract_info(video_url, download=False) or {}
+
+
+def download_video(video_url: str, cookie_file: str, work_dir: str,
+                   info: dict | None = None, html: str = "") -> str:
     """
     Lädt TikTok-Inhalt herunter:
     - Normales Video  → video.mp4
@@ -430,14 +511,11 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
     - Slideshow       → alle Slides + Audio → je 2.5s pro Bild
     Slideshow wird VOR dem Haupt-Download erkannt, damit kein falsches Einzelbild-Video entsteht.
     """
-    # ── Schritt 1: Info holen (ohne Download) → Slideshow-Erkennung ──────────
-    with yt_dlp.YoutubeDL({
-        "cookiefile": cookie_file, "quiet": True,
-        "no_warnings": True, "socket_timeout": 30,
-    }) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+    # ── Schritt 1: Info holen (falls nicht mitgegeben) → Slideshow-Erkennung ──
+    if info is None:
+        info = _video_info(video_url, cookie_file)
 
-    slide_paths = _detect_slideshow(info or {}, video_url, cookie_file, work_dir)
+    slide_paths = _detect_slideshow(info, video_url, cookie_file, work_dir, html=html)
 
     # ── Schritt 2a: Slideshow ─────────────────────────────────────────────────
     if len(slide_paths) > 1:
@@ -491,6 +569,17 @@ def download_video(video_url: str, cookie_file: str, work_dir: str) -> str:
          if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")),
         key=lambda f: (0 if f.name.startswith("slide_") else 1, f.name),
     )
+
+    # Letzte Rettung gegen schwarzen Screen: bestes Thumbnail aus den Metadaten laden
+    if not thumb_files:
+        thumbs = sorted(
+            (t for t in info.get("thumbnails", []) if t.get("url")),
+            key=lambda t: (t.get("width") or 0) * (t.get("height") or 0),
+        )
+        if thumbs:
+            log.info("Kein lokales Bild → lade bestes Thumbnail aus Metadaten")
+            paths = _download_urls_as_slides([thumbs[-1]["url"]], work_dir)
+            thumb_files = [Path(p) for p in paths]
 
     # Sound-Länge bestimmt die Video-Länge (min. 3s wegen Instagram-Minimum)
     duration = max(3.0, _audio_duration(audio))
@@ -1181,8 +1270,46 @@ def main() -> None:
             tag = f"tmp-vid-{video_id}-{int(time.time())}"
 
             try:
+                # ── Voll-Metadaten + Webseite holen (Privacy, echte Caption, Slideshow) ──
+                log.info("Hole Video-Details...")
+                info = _video_info(video_url, cookie_file)
+                html = _fetch_tiktok_html(video_url, cookie_file)
+
+                # ── Privatsphäre prüfen: private Videos NIE crossposten ──────────────
+                privacy = tiktok_privacy(html, info)
+                if privacy == "private":
+                    private_since = video.get("private_since")
+                    if private_since is None:
+                        video["private_since"] = datetime.now(timezone.utc).isoformat()
+                        log.info(f"🔒 {video_id} ist privat → übersprungen (wird {PRIVATE_RECHECK_DAYS} Tage erneut geprüft)")
+                        notify(
+                            f"🔒 **{video_id} ist privat** → wird nicht gepostet.\n"
+                            f"Falls du es in den nächsten {PRIVATE_RECHECK_DAYS} Tagen auf "
+                            f"öffentlich stellst, wird es automatisch nachgeholt."
+                        )
+                    else:
+                        private_days = (datetime.now(timezone.utc)
+                                        - datetime.fromisoformat(private_since)).total_seconds() / 86400
+                        if private_days > PRIVATE_RECHECK_DAYS:
+                            queue.remove(video)
+                            log.info(f"🔒 {video_id} dauerhaft privat → endgültig übersprungen")
+                            notify(f"🔒 **{video_id}** blieb privat → endgültig übersprungen.")
+                        else:
+                            log.info(f"🔒 {video_id} weiterhin privat ({private_days:.1f}/{PRIVATE_RECHECK_DAYS} Tage)")
+                    write_state(state)
+                    continue
+                if privacy == "unknown":
+                    log.warning("Privatsphäre-Status nicht ermittelbar → behandle als öffentlich")
+
+                # ── Echte Caption aus Voll-Metadaten (Profil-Liste ist oft leer/falsch) ──
+                full_caption = (info.get("description") or info.get("title") or "").strip()
+                if full_caption and full_caption != raw_caption:
+                    log.info(f"Caption korrigiert: {full_caption[:60]!r} (vorher: {raw_caption[:40]!r})")
+                    raw_caption = full_caption
+                    video["description"] = full_caption  # auch für Retries persistieren
+
                 log.info("Lade Video herunter...")
-                video_path = download_video(video_url, cookie_file, work_dir)
+                video_path = download_video(video_url, cookie_file, work_dir, info=info, html=html)
                 log.info(f"Download OK: {video_path}")
 
                 archive_video(video_path, video_id, raw_caption)
