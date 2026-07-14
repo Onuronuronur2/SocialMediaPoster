@@ -451,6 +451,27 @@ def _detect_slideshow(info: dict, video_url: str, cookie_file: str,
     return []
 
 
+def _log_video_specs(path: str) -> None:
+    """Loggt Codec, Auflösung und Bitrate der fertigen Datei (Qualitätskontrolle)."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,width,height,bit_rate",
+             "-of", "json", path],
+            capture_output=True, text=True,
+        )
+        stream = json.loads(result.stdout)["streams"][0]
+        bitrate_kbit = int(stream.get("bit_rate") or 0) / 1000
+        size_mb = Path(path).stat().st_size / 1_000_000
+        log.info(
+            f"📹 Video-Specs: {stream.get('codec_name')} "
+            f"{stream.get('width')}x{stream.get('height')}, "
+            f"{bitrate_kbit:.0f} kbit/s, {size_mb:.1f} MB"
+        )
+    except Exception as e:
+        log.warning(f"Specs-Check fehlgeschlagen: {e}")
+
+
 def _audio_duration(path: str) -> float:
     """Ermittelt die Audio-Länge in Sekunden via ffprobe (0.0 bei Fehler)."""
     try:
@@ -535,15 +556,18 @@ def download_video(video_url: str, cookie_file: str, work_dir: str,
         return _build_slideshow_video(slide_paths, str(audio_files[0]), work_dir)
 
     # ── Schritt 2b: Normaler Download (Video oder Einzelfoto) ────────────────
+    # format_sort: höchste Auflösung, dann H.264 vor H.265 (höhere Bitrate bei
+    # TikTok + Instagram verarbeitet H.264 am besten), dann höchste Bitrate.
+    # Kein Re-Encode: der Stream wird 1:1 übernommen wie TikTok ihn liefert.
     out_tpl  = str(Path(work_dir) / "video.%(ext)s")
     ydl_opts = {
         "cookiefile": cookie_file,
         "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "vcodec:h264", "tbr"],
         "outtmpl": out_tpl,
         "merge_output_format": "mp4",
         "writethumbnail": True,
         "convert_thumbnails": "jpg",
-        "postprocessor_args": {"ffmpeg": ["-crf", "18", "-preset", "slow"]},
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 60,
@@ -1311,6 +1335,7 @@ def main() -> None:
                 log.info("Lade Video herunter...")
                 video_path = download_video(video_url, cookie_file, work_dir, info=info, html=html)
                 log.info(f"Download OK: {video_path}")
+                _log_video_specs(video_path)
 
                 archive_video(video_path, video_id, raw_caption)
 
